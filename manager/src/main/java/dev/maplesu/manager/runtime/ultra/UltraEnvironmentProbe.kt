@@ -336,7 +336,10 @@ object UltraEnvironmentProbe {
                         snapshotKey = null
                         snapshotBootId = bootId
                         publish(State.Unknown, "sdkError=${ownerBefore?.receipt?.sdkError}", false,
-                            ownerBefore?.receipt?.sdkError == "ERR_MODULE_NO_BOOT", activation = requestActivation)
+                            // A null owner means the Ultra SDK channel never answered at all (no root,
+                            // no helper): that is proof the kernel channel is absent, not missing evidence.
+                            ownerBefore == null || ownerBefore.receipt.sdkError == "ERR_MODULE_NO_BOOT",
+                            activation = requestActivation)
                     }
                 }
                 cachedOwnerObservation?.let { cached ->
