@@ -19,6 +19,7 @@ import json
 import sys
 import re
 import shutil
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -390,10 +391,23 @@ SHARK_MANIFEST = SHARK_DIR / "manifest.json"
 SHARK_PLANTS = SHARK_DIR / "plants" / "arm64-v8a"
 
 
+def _build_missing_plants() -> None:
+    """Compile the per-kernel plants when the exported tree carries no built copies."""
+    builder = SHARK_DIR / "build_plants.py"
+    if not builder.is_file():
+        fail("plant builder missing")
+    print("package.py: no built plants in the tree; compiling them from retained sources", flush=True)
+    result = subprocess.run([sys.executable, str(builder)], cwd=str(HERE))
+    if result.returncode:
+        fail("plant build failed")
+
+
 def planted_artifacts():
     """Our built plant digests, verified against the retained manifest."""
     if not SHARK_MANIFEST.is_file():
         fail("plant manifest missing")
+    if not (SHARK_PLANTS / "plant-61821").is_file():
+        _build_missing_plants()
     document = json.loads(SHARK_MANIFEST.read_text(encoding="utf-8"))
     records = {}
     for item in document.get("plants") or []:
