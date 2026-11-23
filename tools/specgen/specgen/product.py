@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import urllib.request
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -15,11 +16,27 @@ HOST_CACHE = Path(tempfile.gettempdir()) / 'MapleSU-specgen-product'
 JVM_FLAGS = ['-no-stdlib', '-no-reflect', '-jvm-target', '17']
 
 
+def _fetch_from_maven(group: str, artifact: str, version: str) -> Path:
+    """Fetch a host-only dependency Gradle has not resolved into its cache yet."""
+    target = HOST_CACHE / "deps" / (artifact + "-" + version + ".jar")
+    if target.is_file():
+        return target
+    target.parent.mkdir(parents=True, exist_ok=True)
+    url = ("https://repo.maven.apache.org/maven2/" + group.replace(".", "/") + "/"
+           + artifact + "/" + version + "/" + artifact + "-" + version + ".jar")
+    with urllib.request.urlopen(url, timeout=180) as response:
+        target.write_bytes(response.read())
+    return target
+
+
 def cached_jar(group: str, artifact: str, version: str) -> Path:
     cache = Path(os.environ.get("GRADLE_USER_HOME", Path.home() / ".gradle"))
     files = sorted((cache / "caches/modules-2/files-2.1" / group / artifact / version).glob("*/*.jar"))
     if not files:
-        raise RuntimeError("ULTRA_HOST_DEPENDENCY_MISSING:" + artifact)
+        try:
+            files = [_fetch_from_maven(group, artifact, version)]
+        except Exception as error:
+            raise RuntimeError("ULTRA_HOST_DEPENDENCY_MISSING:" + artifact) from error
     return files[0]
 
 
