@@ -336,10 +336,7 @@ object UltraEnvironmentProbe {
                         snapshotKey = null
                         snapshotBootId = bootId
                         publish(State.Unknown, "sdkError=${ownerBefore?.receipt?.sdkError}", false,
-                            // A null owner means the Ultra SDK channel never answered at all (no root,
-                            // no helper): that is proof the kernel channel is absent, not missing evidence.
-                            ownerBefore == null || ownerBefore.receipt.sdkError == "ERR_MODULE_NO_BOOT",
-                            activation = requestActivation)
+                            ownerBefore?.receipt?.sdkError == "ERR_MODULE_NO_BOOT", activation = requestActivation)
                     }
                 }
                 cachedOwnerObservation?.let { cached ->
@@ -469,7 +466,9 @@ object UltraEnvironmentProbe {
         state == State.Fault && safeMode -> "ultra:fault"
         kernelRootVerified && (state == State.Unknown || state == State.NotInstalled) -> "ultra:kernel"
         state == State.Unknown && kernelChannelAbsent -> null
-        state == State.Unknown -> throw IllegalStateException("ULTRA_RECOVERY_PROBE_UNKNOWN")
+        // An unreadable environment is not a mode. Throwing here made every probe failure a hard
+        // environment-check failure, which hides the install entry on a device that has no root at all.
+        state == State.Unknown -> null
         state == State.NoKey -> throw IllegalStateException("ULTRA_RECOVERY_IDENTITY_UNKNOWN")
         else -> null
     }
