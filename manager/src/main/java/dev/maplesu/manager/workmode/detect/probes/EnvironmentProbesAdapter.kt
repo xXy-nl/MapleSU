@@ -70,8 +70,10 @@ class EnvironmentProbesAdapter(private val context: Context) : EnvironmentProbes
         }
         // 有判据读失败 ⇒ 不能断言"没有 Ultra 环境"（UNKNOWN ≠ 没有）。
         if (failures.isNotEmpty()) {
+            runCatching { android.util.Log.w("MapleSUDiag", "currentUltraFingerprint failures=" + failures.joinToString(",")) }
             throw IllegalStateException("ULTRA_PROBE_PARTIAL:" + failures.joinToString(","))
         }
+        runCatching { android.util.Log.i("MapleSUDiag", "currentUltraFingerprint: no judge hit, no failures") }
         return null
     }
 
@@ -87,6 +89,10 @@ class EnvironmentProbesAdapter(private val context: Context) : EnvironmentProbes
         dev.maplesu.manager.runtime.ultra.UltraIdentityRecovery.recover(context.applicationContext)
         UltraEnvironmentProbe.refresh(context.applicationContext, force = false)
         val observed = UltraEnvironmentProbe.currentSnapshot(context)
+        runCatching {
+            android.util.Log.i("MapleSUDiag", "ultraFingerprint state=" + observed.state +
+                " rootVerified=" + observed.kernelRootVerified + " channelAbsent=" + observed.kernelChannelAbsent)
+        }
         return UltraEnvironmentProbe.recoveryFingerprint(observed.state, UltraEnvironmentProbe.isSafeMode(context),
             observed.kernelRootVerified, observed.kernelChannelAbsent)
     }
