@@ -290,7 +290,10 @@ object UltraEnvironmentInstaller {
                 if (error is InterruptedException) Thread.currentThread().interrupt()
                 "POLICY_BACKEND_PREPARATION_EXCEPTION"
             }
-            if (failure != null) return Outcome(false, "POLICY_BACKEND_PREPARATION_FAILED", reason = failure)
+            if (failure != null) {
+                quietLog { Log.w(TAG, "prepareInstall failed reason=$failure") }
+                return Outcome(false, "POLICY_BACKEND_PREPARATION_FAILED", reason = failure)
+            }
             pendingScopeFailure()?.let { return it }
             // Complete tools/policy preflight before replacing the recovery identity.
             // A tools failure must not first stop or publish the current broker tuple.
