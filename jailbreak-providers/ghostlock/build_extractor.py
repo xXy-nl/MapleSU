@@ -44,7 +44,7 @@ def build(ndk, output):
     env.update(CC_aarch64_linux_android=str(compiler),
                AR_aarch64_linux_android=str(archive),
                CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=str(compiler),
-               CARGO_NET_OFFLINE="true",
+               CARGO_NET_OFFLINE="false",
                CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS=
                "-C force-unwind-tables=no -C link-arg=-Wl,-z,max-page-size=16384")
     if toolchain.endswith("windows-gnu"):
@@ -61,7 +61,7 @@ def build(ndk, output):
     build_temp = target_dir.parent / "tmp"
     build_temp.mkdir(parents=True, exist_ok=True)
     env.update(TEMP=str(build_temp), TMP=str(build_temp), TMPDIR=str(build_temp))
-    command = [cargo, "+" + toolchain, "build", "--offline", "--locked", "--release",
+    command = [cargo, "+" + toolchain, "build", "--locked", "--release",
                "--target", "aarch64-linux-android", "--target-dir", str(target_dir),
                "--manifest-path", str(NATIVE / "Cargo.toml")]
     subprocess.run(command, env=env, check=True)
