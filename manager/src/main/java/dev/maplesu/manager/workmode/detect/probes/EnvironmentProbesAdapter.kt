@@ -91,7 +91,8 @@ class EnvironmentProbesAdapter(private val context: Context) : EnvironmentProbes
         val observed = UltraEnvironmentProbe.currentSnapshot(context)
         runCatching {
             android.util.Log.i("MapleSUDiag", "ultraFingerprint state=" + observed.state +
-                " rootVerified=" + observed.kernelRootVerified + " channelAbsent=" + observed.kernelChannelAbsent)
+                " rootVerified=" + observed.kernelRootVerified + " channelAbsent=" + observed.kernelChannelAbsent +
+                " detail=" + observed.detail)
         }
         return UltraEnvironmentProbe.recoveryFingerprint(observed.state, UltraEnvironmentProbe.isSafeMode(context),
             observed.kernelRootVerified, observed.kernelChannelAbsent)
