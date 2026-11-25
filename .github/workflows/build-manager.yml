@@ -208,7 +208,7 @@ jobs:
           find linux -xtype l -print -delete
           python3 - <<'PY'
           import pathlib, re
-          root = pathlib.Path("linux")
+          root = pathlib.Path("linux").resolve()
           patched = []
           for kc in root.rglob("Kconfig*"):
               if not kc.is_file():
@@ -219,25 +219,25 @@ jobs:
                   m = re.match(r'\s*source\s+"([^"]+)"', line)
                   if m:
                       raw = m.group(1)
-                      # Only vendor-owned paths are missing from the OSS drop; skip variable paths.
-                      if "$" not in raw and ("vendor" in raw or "oplus" in raw):
-                          target = (kc.parent / raw).resolve()
+                      if "$" not in raw:
+                          # Kconfig source paths are relative to the kernel tree root, not this file.
+                          target = (root / raw).resolve()
                           if not target.exists():
-                              out.append("# " + line.rstrip() + "  # vendor tree not published" + chr(10))
-                              patched.append(str(kc))
+                              out.append("# " + line.rstrip() + "  # not published in OSS tree" + chr(10))
+                              patched.append(raw)
                               dirty = True
                               continue
                   out.append(line)
               if dirty:
                   kc.write_text("".join(out), errors="ignore")
-          print("patched vendor sources:", len(patched))
-          for item in sorted(set(patched))[:20]:
+          print("patched missing sources:", len(patched))
+          for item in sorted(set(patched))[:25]:
               print("  ", item)
           PY
           cp ci/kernel/target.config linux/.config
           make -C linux ARCH=arm64 LLVM=1 olddefconfig
           grep -E '^CONFIG_MODULES=|^CONFIG_MODVERSIONS=|^CONFIG_LOCALVERSION=|^CONFIG_MODULE_SIG=' linux/.config || true
-          grep -q '^CONFIG_MODULES=y' linux/.config || { echo 'FATAL: CONFIG_MODULES disabled after olddefconfig'; exit 1; }
+          grep -q '^CONFIG_MODULES=y' linux/.config || { echo 'FATAL: CONFIG_MODULES disabled'; exit 1; }
       - name: Build kernel and module symbols
         run: |
           set -o pipefail
