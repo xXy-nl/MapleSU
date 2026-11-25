@@ -337,11 +337,11 @@ jobs:
       - name: Overlay artifacts into tree
         run: |
           ls -R /tmp/kb | head -40
-          cp /tmp/kb/Module.symvers linux/Module.symvers
-          cp /tmp/kb/.config linux/.config
+          cp /tmp/kb/linux/Module.symvers linux/Module.symvers
+          cp /tmp/kb/linux/.config linux/.config
           mkdir -p linux/include/generated linux/include/config
-          cp /tmp/kb/utsrelease.h linux/include/generated/utsrelease.h || true
-          cp /tmp/kb/kernel.release linux/include/config/kernel.release || true
+          cp /tmp/kb/linux/include/generated/utsrelease.h linux/include/generated/utsrelease.h || true
+          cp /tmp/kb/linux/include/config/kernel.release linux/include/config/kernel.release || true
           grep -m1 UTS_RELEASE linux/include/generated/utsrelease.h || true
       - name: Build bridge
         run: |
