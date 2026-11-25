@@ -241,7 +241,13 @@ jobs:
       - name: Build kernel and module symbols
         run: |
           set -o pipefail
-          make -C linux ARCH=arm64 LLVM=1 -j"$(nproc)" Image modules 2>&1 | tail -n 60
+          make -C linux ARCH=arm64 LLVM=1 -j"$(nproc)" Image modules > /tmp/build.log 2>&1 || true
+          echo "--- tail of build log ---"
+          tail -n 80 /tmp/build.log
+          echo "--- first errors ---"
+          grep -nE 'error:|Error [0-9]|No rule to make|fatal error|undefined' /tmp/build.log | head -n 40 || true
+          if [ ! -f linux/Module.symvers ]; then echo "BUILD FAILED: Module.symvers missing"; exit 1; fi
+          ls -l linux/Module.symvers linux/arch/arm64/boot/Image
       - name: Report artifacts
         run: |
           ls -l linux/arch/arm64/boot/Image linux/Module.symvers linux/vmlinux || true
