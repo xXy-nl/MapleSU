@@ -18,6 +18,7 @@ on:
           - manager
           - kernel-bridge
           - kernel-build
+          - bridge-build
         default: manager
         required: true
   pull_request:
@@ -310,3 +311,51 @@ jobs:
             linux/arch/arm64/boot/Image
             runtime/ultra/boot/init-bridge/*.ko
             bridge-evidence/**
+
+  bridge-only:
+    if: github.event_name == 'workflow_dispatch' && inputs.task == 'bridge-build'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libssl-dev libelf-dev lld llvm clang dwarves python3-pyelftools
+      - name: Fetch kernel source
+        run: |
+          curl -fL --retry 3 -o /tmp/kernel.tar.gz "https://codeload.github.com/cctv18/android_kernel_common_oneplus_sm8650/tar.gz/refs/heads/oneplus/sm8650_b_16.0.0_oneplus12_6.1.141"
+          mkdir -p linux
+          tar -xzf /tmp/kernel.tar.gz -C linux --strip-components=1
+      - name: Restore kernel build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: kernel-build
+          run-id: 45576674648
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: /tmp/kb
+      - name: Overlay artifacts into tree
+        run: |
+          ls -R /tmp/kb | head -40
+          cp /tmp/kb/Module.symvers linux/Module.symvers
+          cp /tmp/kb/.config linux/.config
+          mkdir -p linux/include/generated linux/include/config
+          cp /tmp/kb/utsrelease.h linux/include/generated/utsrelease.h || true
+          cp /tmp/kb/kernel.release linux/include/config/kernel.release || true
+          grep -m1 UTS_RELEASE linux/include/generated/utsrelease.h || true
+      - name: Build bridge
+        run: |
+          echo "python: $(python3 --version)"
+          python3 runtime/ultra/boot/init-bridge/build_target.py --repo-root "$PWD" --kernel-build "$PWD/linux" --llvm-bin /usr/lib/llvm-18/bin --module-source "$PWD/runtime/ultra/boot/init-bridge" --evidence "$PWD/bridge-evidence" --source "$PWD/runtime/ultra/boot/init-bridge/bridge.c" --kernel-source "$PWD/linux" > /tmp/bridge.log 2>&1 || true
+          echo "--- bridge log ---"
+          tail -n 80 /tmp/bridge.log
+          ls -l runtime/ultra/boot/init-bridge/*.ko || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bridge-only
+          if-no-files-found: warn
+          path: |
+            runtime/ultra/boot/init-bridge/*.ko
+            bridge-evidence/**
+            /tmp/bridge.log
