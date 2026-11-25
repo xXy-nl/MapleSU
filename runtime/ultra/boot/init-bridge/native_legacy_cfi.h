@@ -5,6 +5,7 @@
 
 /* Only the actual Kbuild module path owns this contract. A copied raw payload
  * cannot acquire ownership by filling a module pointer or publishing shadow. */
+/* Loader lifecycle/context only; native compiler checks remain at calls. */
 int msu_legacy_module_ready(void);
 bool msu_legacy_module_text(const void *first, unsigned long bytes);
 bool msu_legacy_probe_matches(unsigned long canonical, unsigned long probed);

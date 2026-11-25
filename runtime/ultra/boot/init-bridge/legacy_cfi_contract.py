@@ -111,8 +111,227 @@ def callsite_types(image,table,caller,register=None):
     if not result: raise ValueError('LEGACY_CFI_CALLSITE_MISSING:'+caller)
     return result
 
+
+def unchecked_trace_machine(image,table,caller):
+    """No-BTF machine facts only; neither a C prototype nor a CFI type ID."""
+    from capstone import Cs,CS_ARCH_ARM64,CS_MODE_LITTLE_ENDIAN
+    from capstone.arm64 import ARM64_OP_IMM,ARM64_OP_REG,ARM64_OP_MEM
+    import hashlib
+    def fail(label): raise ValueError('LEGACY_CFI_UNCHECKED_TRACE:'+label)
+    def unique(name):
+        values=offsets(table,name)
+        if len(values)!=1: fail('SYMBOL:'+name)
+        return next(iter(values))
+    def bounds(name,limit=65536):
+        start=unique(name); end=min((row[0] for row in table.rows if row[0]>start),default=len(image))
+        if not 0<=start<end<=len(image) or end-start>limit: fail('BOUNDS:'+name)
+        return start,end
+    def reg(ins,index):
+        args=ins.operands
+        return ins.reg_name(args[index].reg) if index<len(args) and args[index].type==ARM64_OP_REG else ''
+    def gp64(register): return register in {'x'+str(i) for i in range(31)}
+    def imm(ins,index):
+        args=ins.operands
+        return args[index].imm if index<len(args) and args[index].type==ARM64_OP_IMM and not args[index].shift.value else None
+    def memory(ins,index,base,disp=0,indexed='',writeback=False):
+        args=ins.operands
+        if index>=len(args) or args[index].type!=ARM64_OP_MEM: return False
+        arg=args[index]
+        return (ins.reg_name(arg.mem.base)==base and arg.mem.disp==disp and
+            (ins.reg_name(arg.mem.index) if arg.mem.index else '')==indexed and
+            not arg.ext and not arg.shift.value and ins.writeback==writeback)
+    def same(ins,mnemonic,operands): return (ins.mnemonic,ins.op_str)==(mnemonic,operands)
+    decoder=Cs(CS_ARCH_ARM64,CS_MODE_LITTLE_ENDIAN); decoder.detail=True
+    def function(name,allow_calls=False):
+        start,end=bounds(name)
+        if start%4 or end%4: fail('BOUNDS:'+name)
+        rows=list(decoder.disasm(image[start:end],start)); by={row.address:row for row in rows}
+        if len(rows)*4!=end-start: fail('DECODE:'+name)
+        pending=[start]; edges={}
+        while pending:
+            at=pending.pop()
+            if at in edges: continue
+            ins=by.get(at)
+            if ins is None: fail('CFG_BOUNDS')
+            op=ins.mnemonic
+            if op=='br' or (not allow_calls and op in ('bl','brk','hlt')): fail('INSTRUMENTED_OR_UNKNOWN_CALL')
+            if op in ('ret','retab','retaa','brk','hlt') or (op=='bl' and imm(ins,0) in offsets(table,'__stack_chk_fail')):
+                following=[]
+            elif op=='b': following=[imm(ins,0)]
+            else:
+                following=[at+4]
+                if op.startswith(('b.','cb','tb')): following.append(imm(ins,len(ins.operands)-1))
+            edges[at]=following; pending.extend(following)
+        body=[row for row in rows if row.address in edges]
+        return dict(name=name,start=start,bytes=end-start,sha256=hashlib.sha256(image[start:end]).hexdigest()),body,edges
+    def flow(rows,edges):
+        by={ins.address:ins for ins in rows}; entry=rows[0].address
+        parents={at:set() for at in edges}
+        for at,following in edges.items():
+            for target in following: parents[target].add(at)
+        dom={at:({at} if at==entry else set(edges)) for at in edges}
+        changed=True
+        while changed:
+            changed=False
+            for at in edges:
+                if at==entry: continue
+                value={at}|set.intersection(*(dom[p] for p in parents[at]))
+                if value!=dom[at]: dom[at]=value; changed=True
+        def closure(at,graph):
+            seen=set(); pending=[at]
+            while pending:
+                item=pending.pop()
+                if item in seen: continue
+                seen.add(item); pending.extend(graph[item])
+            return seen
+        def intact(register,definition,use):
+            if definition is not None and definition not in dom[use]: return False
+            region=closure(use,parents)
+            if definition is not None: region&=closure(definition,edges)
+            register=register.replace('w','x',1)
+            for at in region-{definition,use}:
+                ins=by[at]; _,writes=ins.regs_access()
+                if register in {ins.reg_name(item).replace('w','x',1) for item in writes}: return False
+                if ins.mnemonic in ('bl','blr') and register not in {'x'+str(i) for i in range(19,29)}: return False
+            return True
+        def saved(source,register,uses):
+            matches=[ins for ins in rows if same(ins,'mov',register+', '+source) and
+                intact(source,None,ins.address) and all(intact(register,ins.address,at) for at in uses)]
+            if len(matches)!=1 or register not in {'x'+str(i) for i in range(19,29)}: fail('REGISTER_ORIGIN:'+source)
+            return matches[0].address
+        return dom,intact,saved
+    if caller!='__traceiter_sys_enter': fail('MACHINE_CALLER')
+    if offsets(table,'__start_BTF') or offsets(table,'__stop_BTF'): fail('MACHINE_BTF_PRESENT')
+    fact,body,edges=function(caller); start=fact['start']
+    point,point_end=bounds('__tracepoint_sys_enter',4096)
+    name,name_end=bounds('__tpstrtab_sys_enter',256)
+    if (point%8 or point_end-point<8 or struct.unpack_from('<Q',image,point)[0]!=table.text_base+name or
+            image[name:name_end].split(b'\0',1)[0]!=b'sys_enter'): fail('OBJECT_NAME')
+    canonical=offsets(table,caller+'.cfi_jt')|offsets(table,'__cfi_jt_'+caller)
+    entries=[(at,struct.unpack_from('<Q',image,at)[0]-table.text_base)
+        for at in range(point,point_end-7,8)
+        if struct.unpack_from('<Q',image,at)[0]-table.text_base in canonical|{start}]
+    if len(entries)!=1: fail('ITERATOR_POINTER')
+    iterator_field,entry=entries[0]
+    if entry!=start:
+        at=entry
+        if word(image,at) in (0xd503245f,0xd50324df): at+=4
+        raw=word(image,at)
+        if raw&0xfc000000!=0x14000000 or at+signed(raw&0x03ffffff,26)*4!=start: fail('ITERATOR_CANONICAL')
+    bases=[i for i,row in enumerate(body[:-1]) if row.mnemonic=='adrp' and body[i+1].mnemonic=='add' and
+        reg(row,0)==reg(body[i+1],0)==reg(body[i+1],1) and imm(row,1) is not None and imm(body[i+1],2) is not None and
+        not body[i+1].operands[2].shift.value]
+    if len(bases)!=1: fail('FUNCS_ADDRESS')
+    first=bases[0]; chunk=body[first:first+12]
+    if len(chunk)!=12 or any(right.address!=left.address+4 for left,right in zip(chunk,chunk[1:])): fail('LOOP_BOUNDS')
+    funcs=imm(chunk[0],1)+imm(chunk[1],2); field=funcs-point
+    if (funcs%8 or not point<=funcs<=point_end-8 or funcs==iterator_field or
+            struct.unpack_from('<Q',image,funcs)[0]): fail('FUNCS_ADDRESS')
+    node=reg(chunk[2],0); base=reg(chunk[0],0)
+    if chunk[2].mnemonic not in ('ldar','ldapr','ldr') or not memory(chunk[2],1,base): fail('LIST_LOAD')
+    if chunk[3].mnemonic!='cbz' or reg(chunk[3],0)!=node: fail('EMPTY_EDGE')
+    saved={reg(ins,1):reg(ins,0) for ins in chunk[4:6] if ins.mnemonic=='mov'}
+    if set(saved)!={'x1','x2'} or len({node,*saved.values()})!=3 or any(
+            item not in {'x'+str(i) for i in range(19,29)} for item in (node,*saved.values())): fail('ARGUMENT_SAVE')
+    fn=reg(chunk[6],0)
+    if (chunk[6].mnemonic!='ldp' or reg(chunk[6],1)!='x0' or not memory(chunk[6],2,node) or
+            fn not in {'x'+str(i) for i in range(3,18)}): fail('CALLBACK_LOAD')
+    if (not same(chunk[7],'mov','x1, '+saved['x1']) or not same(chunk[8],'mov','x2, '+saved['x2']) or
+            not same(chunk[9],'blr',fn)): fail('CALL_ARGUMENTS')
+    stride=chunk[10].operands[1].mem.disp if len(chunk[10].operands)==2 and chunk[10].operands[1].type==ARM64_OP_MEM else 0
+    following=body[first+12] if first+12<len(body) else None
+    if (stride<16 or stride>256 or stride%8 or chunk[10].mnemonic!='ldr' or
+            not memory(chunk[10],1,node,stride,writeback=True) or chunk[11].mnemonic!='cbnz' or
+            reg(chunk[10],0)!=fn or reg(chunk[10],0)!=reg(chunk[11],0) or imm(chunk[11],1)!=chunk[6].address or
+            following is None or imm(chunk[3],1)!=following.address): fail('LOOP_EDGES')
+    for ins in body[:first]:
+        _,writes=ins.regs_access()
+        if any(ins.reg_name(item) in ('x1','x2','w1','w2') for item in writes): fail('ARGUMENT_CLOBBER')
+        if ins.mnemonic not in ('paciasp','pacibsp','bti','nop','str','stp','mov','sub','add'): fail('PROLOGUE')
+    tail=body[first+12:]
+    if not tail or tail[-1].mnemonic not in ('ret','retab','retaa') or any(ins.mnemonic not in
+            ('ldr','ldp','mov','add','autiasp','autibsp','ret','retab','retaa','nop') for ins in tail): fail('EPILOGUE')
+    if sum(ins.mnemonic=='blr' for ins in body)!=1 or sum(ins.mnemonic.startswith(('b.','cb','tb')) for ins in body)!=2:
+        fail('CFG_SHAPE')
+    # Corroborate the inferred record stride/fields with the actual native writer.
+    writer,wrows,wedges=function('tracepoint_add_func',True); dom,intact,save=flow(wrows,wedges)
+    blocks=[]
+    for i in range(len(wrows)-9):
+        group=wrows[i:i+10]
+        if [ins.mnemonic for ins in group]!=['ldp','ldr','mov','add','cmn','smaddl','smull','stp','str','str']: continue
+        if any(right.address!=left.address+4 for left,right in zip(group,group[1:])): continue
+        cb,data=reg(group[0],0),reg(group[0],1); record=group[0].operands[2]
+        if record.type!=ARM64_OP_MEM: continue
+        record=group[0].reg_name(record.mem.base); priority=reg(group[1],0); size=reg(group[2],0)
+        count,next_count=reg(group[3],1),reg(group[3],0); old=reg(group[4],0)
+        slot,index,new=reg(group[5],0),reg(group[5],1),reg(group[5],3); product=reg(group[6],0)
+        if (not all(gp64(item) for item in (cb,data,priority,record,old,slot,new,product)) or
+                not memory(group[0],2,record) or not memory(group[1],1,record,16) or
+                not size.startswith('w') or imm(group[2],1)!=stride or
+                not same(group[3],'add',next_count+', '+count+', #1') or imm(group[4],1)!=4095 or
+                not same(group[5],'smaddl',slot+', '+index+', '+size+', '+new) or
+                not same(group[6],'smull',product+', '+next_count+', '+size) or
+                (reg(group[7],0),reg(group[7],1))!=(data,priority) or not memory(group[7],2,slot,8) or
+                reg(group[8],0)!=cb or not memory(group[8],1,slot) or reg(group[9],0)!='xzr' or
+                not memory(group[9],1,new,indexed=product)): continue
+        if (not intact(cb,group[0].address,group[8].address) or not intact(data,group[0].address,group[7].address) or
+                not intact(priority,group[1].address,group[7].address)): continue
+        blocks.append((group,record,old,new))
+    if len(blocks)!=1: fail('WRITER_RECORD')
+    group,record,old,new=blocks[0]
+    publication=[(i,ins) for i,ins in enumerate(wrows) if ins.mnemonic=='stlr' and reg(ins,0)==new]
+    if len(publication)!=2: fail('WRITER_PUBLICATION')
+    point_registers={reg(ins,0) for ins in wrows if ins.mnemonic=='mov' and reg(ins,1)=='x0'}
+    reads=[(ins,pointreg) for ins in wrows for pointreg in point_registers
+        if ins.mnemonic=='ldr' and reg(ins,0)==old and memory(ins,1,pointreg,field)]
+    if len(reads)!=1: fail('WRITER_FUNCS_FIELD')
+    read,pointreg=reads[0]
+    save('x0',pointreg,[read.address,*[wrows[i-1].address for i,_ in publication]])
+    save('x1',record,[group[0].address,group[1].address])
+    if not intact(old,read.address,group[4].address): fail('WRITER_LIST_ORIGIN')
+    allocations=[wrows[i:i+4] for i in range(len(wrows)-3) if wrows[i].mnemonic=='bl' and imm(wrows[i],0)==unique('__kmalloc') and
+        wrows[i+1].mnemonic=='add' and gp64(reg(wrows[i+1],0)) and reg(wrows[i+1],1)=='x0' and imm(wrows[i+1],2)==16 and
+        same(wrows[i+2],'cmp','x0, #0') and same(wrows[i+3],'csel',new+', xzr, '+reg(wrows[i+1],0)+', eq')]
+    if len(allocations)!=1 or any(not intact(new,allocations[0][3].address,at) for at in
+            (group[5].address,group[9].address,*[ins.address for _,ins in publication])): fail('WRITER_ALLOCATION')
+    for i,ins in publication:
+        previous=wrows[i-1]
+        if (not same(previous,'add',reg(previous,0)+', '+pointreg+', #'+hex(field)) or
+                not memory(ins,1,reg(previous,0)) or group[9].address not in dom[ins.address]): fail('WRITER_PUBLICATION')
+    registration,rrows,redges=function('tracepoint_probe_register_prio',True); _,rintact,rsave=flow(rrows,redges)
+    calls=[i for i,ins in enumerate(rrows) if ins.mnemonic=='bl' and imm(ins,0)==writer['start']]
+    if len(calls)!=1 or calls[0]<6: fail('REGISTRATION_CALL')
+    call_index=calls[0]; packet=rrows[call_index-6:call_index+1]
+    if any(right.address!=left.address+4 for left,right in zip(packet,packet[1:])): fail('REGISTRATION_PACKET')
+    tp=reg(packet[2],1); priority=reg(packet[3],1); cb,data=reg(packet[4],0),reg(packet[4],1)
+    if (not same(packet[0],'mov','x1, sp') or not same(packet[1],'mov','w3, #1') or
+            not same(packet[2],'mov','x0, '+tp) or not same(packet[3],'mov','w2, '+priority) or
+            packet[4].mnemonic!='stp' or not memory(packet[4],2,'sp') or packet[5].mnemonic!='str' or
+            reg(packet[5],0)!=priority or not memory(packet[5],1,'sp',16)): fail('REGISTRATION_PACKET')
+    for source,destination,use in (('x0',tp,packet[2]),('x1',cb,packet[4]),('x2',data,packet[4])):
+        rsave(source,destination,[use.address])
+    # The priority save is 32-bit, but still occupies a preserved GP register.
+    priorities=[ins for ins in rrows if same(ins,'mov',priority+', w3') and rintact('w3',None,ins.address) and
+        rintact(priority,ins.address,packet[5].address)]
+    if len(priorities)!=1: fail('REGISTER_ORIGIN:w3')
+    abi=dict(pcs='aapcs64',argumentRegisters=['x0','x1','x2'],argumentBytes=[8,8,8],
+        argumentSources=['record-data','iterator-x1','iterator-x2'],returnValueUsed=False)
+    return dict(fact,caller=caller,callOffset=chunk[9].address,cfiMode='unchecked-native-callsite',
+        reachableOffsets=sorted(edges),tracepointOffset=point,tracepointSymbolBytes=point_end-point,
+        tracepointSha256=hashlib.sha256(image[point:point_end]).hexdigest(),iteratorOffset=entry,
+        iteratorFieldOffset=iterator_field-point,funcsPointerOffset=funcs,recordBytes=stride,funcOffset=0,dataOffset=8,
+        callbackMachineAbi=abi,registrationWriter=dict(registration=registration,writer=writer,
+            registrationPacketOffsets=[ins.address for ins in packet],recordWriteOffsets=[ins.address for ins in group],
+            funcsReadOffset=read.address,publicationOffsets=[ins.address for _,ins in publication],
+            allocationCallOffset=allocations[0][0].address),
+        proof='actual-symbol-bounded-uninstrumented-trace-loop-and-registration-writer',
+        btfAvailable=False,machineAbiQualified=True,targetSemanticSignatureQualified=False,targetCfiTypeIdQualified=False,
+        runtimeOwnerQualified=False,deviceQualified=False)
+
 def unchecked_trace_callsite(image,table,caller):
     """Prove a native tracepoint iterator's actual uninstrumented callback loop."""
+    if not offsets(table,'__start_BTF') and not offsets(table,'__stop_BTF'):
+        return unchecked_trace_machine(image,table,caller)
     from capstone import Cs,CS_ARCH_ARM64,CS_MODE_LITTLE_ENDIAN
     from policy_btf_abi import Btf
     from capstone.arm64 import ARM64_OP_REG,ARM64_OP_MEM
@@ -328,6 +547,42 @@ class ModuleChecker:
     def canonical(self,name):
         body=self.symbol(name); expected=self.address(name)
         rows=self.symbols.get_symbol_by_name('__cfi_jt_'+name) or self.symbols.get_symbol_by_name(name+'.cfi_jt') or []
+        if not rows:
+            routes=[]
+            checker=self.symbol('__cfi_check')
+            if (body['st_info']['type']!='STT_FUNC' or not body['st_size'] or
+                    not self.elf.get_section(body['st_shndx'])['sh_flags']&4 or
+                    not self.elf.get_section(checker['st_shndx'])['sh_flags']&4):
+                raise ValueError('LEGACY_CFI_CANONICAL:'+name)
+            for (section,at),(rel,symbol) in self.relocations.items():
+                if (rel['r_info_type']!=282 or symbol['st_shndx']!=body['st_shndx'] or
+                        symbol['st_value']+rel['r_addend']!=body['st_value']): continue
+                table=self.elf.get_section(section)
+                if not table['sh_flags']&4 or at<4 or at%8!=4 or at+4>table['sh_size']: continue
+                if word(table.data(),at-4) not in (0xd503245f,0xd50324df) or word(table.data(),at)!=0x14000000: continue
+                references=[]
+                for (owner,offset),(high,target) in self.relocations.items():
+                    if (owner!=checker['st_shndx'] or high['r_info_type']!=275 or
+                            target['st_shndx']!=section or target['st_value']+high['r_addend']!=0 or
+                            not checker['st_value']<=offset<offset+8<=checker['st_value']+checker['st_size']): continue
+                    low=self.relocations.get((owner,offset+4))
+                    if (low is None or low[0]['r_info_type']!=277 or low[1]['st_shndx']!=section or
+                            low[1]['st_value']+low[0]['r_addend']!=0): continue
+                    raw=self.elf.get_section(owner).data()
+                    adrp,add=word(raw,offset),word(raw,offset+4)
+                    register=adrp&31
+                    if (adrp&0x9f000000==0x90000000 and add&0xffc00000==0x91000000 and
+                            add&31==register and (add>>5)&31==register): references.append(offset)
+                if references: routes.append(self.bases[section]+at-4)
+            if len(routes)!=1 or not self.elf.get_section(body['st_shndx'])['sh_flags']&4:
+                raise ValueError('LEGACY_CFI_CANONICAL:'+name)
+            entry=routes[0]
+            branch=entry+4
+            raw=int.from_bytes(self.read(branch,4),'little')
+            if branch+signed(raw&0x03ffffff,26)*4!=expected:
+                raise ValueError('LEGACY_CFI_CANONICAL_TARGET:'+name)
+            self.read(expected,4)
+            return entry
         if len(rows)!=1 or rows[0]['st_shndx'] not in self.bases or not self.elf.get_section(rows[0]['st_shndx'])['sh_flags']&4:
             raise ValueError('LEGACY_CFI_CANONICAL:'+name)
         entry=self.bases[rows[0]['st_shndx']]+rows[0]['st_value']; branch=entry
@@ -438,8 +693,7 @@ class ModuleChecker:
 def verify_module(data,target,callbacks=()):
     if target.get('mode')!='legacy-lto-cfi': raise ValueError('LEGACY_CFI_TARGET_MODE')
     checker=ModuleChecker(data)
-    members=[checker.member('init_module',target['initCallsites']),
-             checker.member('msu_legacy_kernel_probe_work',target['workCallsites'])]
+    members=[checker.member('init_module',target['initCallsites'])]
     for name in callbacks: members.append(checker.member(name,target['callbackCallsites'].get(name,[])))
     return {'mode':'legacy-lto-cfi','members':members,'moduleLoaded':False,
             'runtimeOwnerQualified':False,'deviceQualified':False}

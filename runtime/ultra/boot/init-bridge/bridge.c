@@ -7,6 +7,10 @@
 #include <linux/string.h>
 #include <linux/version.h>
 #include "manager_dynamic_layout.h"
+#if defined(MSU_INIT_BRIDGE_RUNTIME_FACTS) && MSU_INIT_BRIDGE_RUNTIME_FACTS
+#include "manager_runtime_btf.h"
+#include "manager_runtime_accessor.h"
+#endif
 #include "manager_resident_host.h"
 #include "boot_events.h"
 #include "preinit.h"
@@ -82,12 +86,19 @@ static int __init msu_init_bridge_start(void)
     struct msu_boot_sdk_layout layout;
     struct msu_deployment_namespace_record deployment;
     unsigned int allocator_flags = 0;
+#if __has_include(<linux/execmem.h>)
+    unsigned int execmem_free = 1;
+#else
+    unsigned int execmem_free = 0;
+#endif
     unsigned int n;
     int error, events_cleanup = 0, native_cleanup = 0;
     bool events_attempted = false, native_attempted = false;
 
+#if !defined(MSU_INIT_BRIDGE_RUNTIME_FACTS) || !MSU_INIT_BRIDGE_RUNTIME_FACTS
     if (!msu_runtime_layout_ready()) { error = -EPROTO; goto clear; }
     if (READ_ONCE(MSU_DYN_FIELD(current, task_struct, pid)) != 1) { error = -EPERM; goto clear; }
+#endif
     if (strnlen(credential, sizeof credential) != MSU_BOOT_SDK_KEY_BYTES) {
         error = -EINVAL;
         goto clear;
@@ -105,12 +116,30 @@ static int __init msu_init_bridge_start(void)
     if (error) goto clear;
     error = msu_init_bridge_imports_init();
     if (error) goto clear;
-    if (!msu_init_bridge_checked_lookup("vmalloc")) allocator_flags = MSU_BOOT_SDK_ALLOCATOR_NOPROF;
-    error = msu_init_bridge_native_layout(allocator_flags, 0, &layout);
+#if defined(MSU_INIT_BRIDGE_RUNTIME_FACTS) && MSU_INIT_BRIDGE_RUNTIME_FACTS
+    /* No relocated field is consumed until both producers publish complete
+     * live layouts. The selected KMI module supplies code, never target offsets. */
+    error = msu_runtime_btf_init(msu_init_bridge_lookup);
+    if (error == -ENOENT) {
+        error = msu_runtime_accessor_init(msu_init_bridge_lookup, msu_init_bridge_resolve_cfi);
+        if (error) pr_err("MapleSU runtime native accessor initialization: %d\n", error);
+    } else if (error) pr_err("MapleSU runtime BTF initialization: %d\n", error);
     if (error) goto clear;
-    /* Init's future helper exec grants no authority. Full environment and
-     * target publication qualification remain separate from event injection. */
-    layout.environment = 0;
+    error = msu_runtime_layout_init(msu_runtime_facts_field);
+    if (error) goto clear;
+    error = msu_init_bridge_native_layout_init(msu_runtime_facts_field);
+    if (error) goto clear;
+    if (!msu_runtime_layout_ready()) { error = -EPROTO; goto clear; }
+    if (READ_ONCE(MSU_DYN_FIELD(current, task_struct, pid)) != 1) { error = -EPERM; goto clear; }
+#endif
+    if (!msu_init_bridge_checked_lookup("vmalloc")) allocator_flags = MSU_BOOT_SDK_ALLOCATOR_NOPROF;
+    if (!msu_init_bridge_checked_lookup("__vmalloc_node_range") &&
+        !msu_init_bridge_checked_lookup("__vmalloc_node_range_noprof"))
+        allocator_flags |= MSU_BOOT_SDK_ALLOCATOR_INNER | MSU_BOOT_SDK_ALLOCATOR_SEGMENTED;
+    error = msu_init_bridge_native_layout(allocator_flags, execmem_free, &layout);
+    if (error) goto clear;
+    /* Preserve the native producer's environment facts in the SDK append.
+     * Publishing those fields grants no helper or application authority. */
     if (deployment_namespace[0]) {
         events_attempted = true;
         error = msu_preinit_start();
@@ -126,7 +155,7 @@ static int __init msu_init_bridge_start(void)
     if (error) goto failed;
     /* Same host's published callbacks and event proxy are boot-owned. */
     __module_get(THIS_MODULE);
-    pr_info("MapleSU init bridge channel initialized; target/environment unqualified\n");
+    pr_info("MapleSU init bridge channel initialized; environment=%u\n", layout.environment);
     error = 0;
     goto clear;
 failed:
@@ -143,6 +172,10 @@ failed:
         error = 0;
     }
 clear:
+#if defined(MSU_INIT_BRIDGE_RUNTIME_FACTS) && MSU_INIT_BRIDGE_RUNTIME_FACTS
+    /* A quarantined module retains its live facts with its callbacks. */
+    if (error) msu_runtime_btf_release();
+#endif
     memzero_explicit(&deployment, sizeof deployment);
     memzero_explicit(credential, sizeof credential);
     memzero_explicit(deployment_namespace, sizeof deployment_namespace);
@@ -158,6 +191,9 @@ static void __exit msu_init_bridge_exit(void)
 module_init(msu_init_bridge_start);
 module_exit(msu_init_bridge_exit);
 MODULE_LICENSE("GPL");
+#if defined(MSU_INIT_BRIDGE_RUNTIME_FACTS) && MSU_INIT_BRIDGE_RUNTIME_FACTS
+MODULE_INFO(maplesu_runtime_facts, "1");
+#endif
 MODULE_DESCRIPTION("MapleSU native init_boot SDK/owner-host bridge candidate");
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
 MODULE_IMPORT_NS("VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver");

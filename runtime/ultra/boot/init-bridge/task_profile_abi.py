@@ -274,6 +274,7 @@ def verify_provenance(report, bridge, selection, build, config):
         fail("CLAIM_IDENTITY")
     if report.get("nativeAlignment", {}).get("independentlyMeasuredFromBridgeBuild") is not True:
         fail("NATIVE_COMPILER_ALIGNMENT_REQUIRED")
+    package.verify_module_debug_source(provenance, bridge, build)
     verify_module(bridge.read_bytes(), report)
 
 
@@ -410,8 +411,11 @@ def main():
     derived = output / "task-profile-btf.elf"
     native_derived = output / "native-probe-btf.elf"
     native_probe_is_elf = paths["nativeProbeObject"].read_bytes().startswith(b"\x7fELF")
-    native_probe_carrier = paths["nativeProbeObject"] if native_probe_is_elf else bridge
-    shutil.copyfile(bridge, derived)
+    debug_source = package.module_debug_source(bridge, paths["strictBuild"])
+    paths["moduleDebugSource"] = debug_source
+    before["moduleDebugSource"] = package.file_identity(debug_source)
+    native_probe_carrier = paths["nativeProbeObject"] if native_probe_is_elf else debug_source
+    shutil.copyfile(debug_source, derived)
     shutil.copyfile(native_probe_carrier, native_derived)
     commands = [[str(args.llvm_objcopy.resolve()), "--decompress-debug-sections", str(derived)],
                 [str(args.pahole.resolve()), "-J", "--btf_features_strict=var,global_var", str(derived)],

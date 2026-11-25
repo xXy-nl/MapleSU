@@ -1,11 +1,8 @@
-"""Unexecuted boot-event unit fixture; real product C, mock VFS/kernel only.
+"""Boot-event unit fixture; real product C, mock VFS/kernel only.
 
 No rc file/helper is installed or run. Reset models a new boot, not a production
 restart. Mock refcounts check ownership order, not real target RCU/CFI behavior.
-Only Aristotle/evidence executes the host compiler and fixture.
 """
-import hashlib
-import json
 import os
 from pathlib import Path
 import subprocess
@@ -13,16 +10,16 @@ import tempfile
 import unittest
 
 BRIDGE = Path(__file__).resolve().parents[1]
-REPO = BRIDGE.parents[6]
-SELECTION = REPO / ".tmp/p2-host-final-20261118/core-builder/deployment54/HOST-DEPLOYMENT-SOURCE-SELECTION.json"
-SELECTION_SHA256 = "34058fd92ddd84a1a7f6d678fae4239f142c028fdc583dd56b78df2b38b671a1"
-CC = os.environ.get("BRIDGE_FIXTURE_CC", "C:/msys64/ucrt64/bin/gcc.exe")
+REPO = BRIDGE.parents[3]
+CC = os.environ.get("BRIDGE_FIXTURE_CC", "C:/msys64/ucrt64/bin/gcc.exe" if os.name == "nt" else "gcc")
 DEFINITIONS = r"""
 #include <assert.h>
 #include <errno.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
 #ifndef EWOULDBLOCK
@@ -30,6 +27,9 @@ DEFINITIONS = r"""
 #endif
 #ifndef ENODATA
 #define ENODATA 61
+#endif
+#ifndef ESTALE
+#define ESTALE 116
 #endif
 #define EIOCBQUEUED 529
 #define CONFIG_ARM64 1
@@ -49,6 +49,19 @@ DEFINITIONS = r"""
 #define min(a, b) ((a) < (b) ? (a) : (b))
 #define cmpxchg(p, from, to) ({ int old_value = *(p); if (old_value == (from)) *(p) = (to); old_value; })
 #define IS_ERR(p) ((uintptr_t)(p) >= (uintptr_t)-4095)
+#define ERR_PTR(error) ((void *)(intptr_t)(error))
+#define PTR_ERR(p) ((intptr_t)(p))
+#define GFP_KERNEL 0
+#define O_RDONLY 0
+#define O_CLOEXEC 1
+#define O_NOFOLLOW 2
+#define O_NONBLOCK 4
+#define O_DIRECTORY 8
+#define S_ISDIR(x) (((x) & 0170000) == 0040000)
+#define __used __attribute__((used))
+#define __section(name) __attribute__((section(name)))
+typedef unsigned int u32;
+typedef unsigned long long u64;
 typedef int64_t loff_t;
 struct task_struct { int pid, refs; } init_task = {1, 1}, other_task = {2, 1};
 struct task_struct *fixture_current = &init_task;
@@ -60,17 +73,18 @@ struct module { int refs; } bridge_module, fs_module;
 #define THIS_MODULE (&bridge_module)
 int deny_file_ref, module_get_calls;
 bool try_module_get(struct module *module) {
+    if (!module) return true;
     ++module_get_calls;
     if (deny_file_ref && module_get_calls == 2) return false;
     ++module->refs; return true;
 }
-void module_put(struct module *module) { assert(module->refs > 0); --module->refs; }
+void module_put(struct module *module) { if (module) { assert(module->refs > 0); --module->refs; } }
 struct mutex { int held; };
 #define DEFINE_MUTEX(name) struct mutex name = {0}
 void mutex_lock(struct mutex *lock) { assert(!lock->held); lock->held = 1; }
 void mutex_unlock(struct mutex *lock) { assert(lock->held); lock->held = 0; }
 struct cred { int euid; } file_cred;
-struct inode { unsigned int i_mode; int i_uid; loff_t size; } rc_inode;
+struct inode { unsigned int i_mode; int i_uid; loff_t size; unsigned int i_nlink; } rc_inode;
 struct path { const char *name; };
 struct file;
 struct kiocb;
@@ -93,6 +107,26 @@ struct kiocb { struct file *ki_filp; loff_t ki_pos; void (*ki_complete)(void); i
 #define IOCB_NOWAIT 1
 bool is_sync_kiocb(struct kiocb *request) { return !request->ki_complete; }
 struct inode *file_inode(struct file *file) { return file->inode; }
+#define MSU_DYN_FIELD(object, type, member) ((object)->member)
+#define f_count refs
+#define i_size size
+long atomic_long_read(const int *value) { return *value; }
+struct inode *msu_dynamic_file_inode(struct file *file) { return file_inode(file); }
+void msu_dynamic_get_task_struct(struct task_struct *task) { get_task_struct(task); }
+void msu_dynamic_put_task_struct(struct task_struct *task) { put_task_struct(task); }
+bool msu_runtime_layout_ready(void) { return true; }
+struct file *filp_open(const char *path, int flags, int mode) {
+    (void)path; (void)flags; (void)mode; return ERR_PTR(-ENOENT);
+}
+void fput(struct file *file) { (void)file; }
+void *kvmalloc(size_t bytes, int flags) { (void)flags; return malloc(bytes); }
+void kvfree(void *pointer) { free(pointer); }
+ssize_t kernel_read(struct file *file, void *buffer, size_t bytes, loff_t *position) {
+    (void)file; (void)buffer; (void)bytes; (void)position; return -EIO;
+}
+#define pr_warn(...) ((void)0)
+int preinit_releases;
+void msu_preinit_release(void) { ++preinit_releases; }
 int file_count(struct file *file) { return file->refs; }
 loff_t i_size_read(struct inode *inode) { return inode->size; }
 const struct file_operations *fops_get(const struct file_operations *ops) {
@@ -117,7 +151,8 @@ size_t copy_to_iter(const char *from, size_t bytes, struct iov_iter *to) {
 void memzero_explicit(void *value, size_t bytes) {
     volatile unsigned char *p = value; while (bytes--) *p++ = 0;
 }
-struct pt_regs { uintptr_t args[4]; };
+struct pt_regs { uintptr_t regs[31]; };
+#define args regs
 uintptr_t regs_get_kernel_argument(struct pt_regs *regs, unsigned int n) { return regs->args[n]; }
 struct kprobe { const char *symbol_name; int (*pre_handler)(struct kprobe *, struct pt_regs *); };
 int probe_error, registrations, removals, atomic_context, irq_off;
@@ -125,15 +160,53 @@ bool in_task(void) { return true; }
 int in_atomic(void) { return atomic_context; }
 int irqs_disabled(void) { return irq_off; }
 int register_kprobe(struct kprobe *probe) {
-    assert(bridge_module.refs == 1 && !strcmp(probe->symbol_name, "vfs_read"));
+    assert(!strcmp(probe->symbol_name, "vfs_read"));
+#if MSU_BOOT_EVENTS_RAW_RESIDENT
+    assert(bridge_module.refs == 0);
+#else
+    assert(bridge_module.refs == 1);
+#endif
     ++registrations; return probe_error;
 }
 void unregister_kprobe(struct kprobe *probe) {
-    (void)probe; assert(bridge_module.refs >= 1); ++removals;
+    (void)probe;
+    assert(!atomic_context && !irq_off);
+#if !MSU_BOOT_EVENTS_RAW_RESIDENT
+    assert(bridge_module.refs >= 1);
+#endif
+    ++removals;
+}
+struct work_struct { void (*func)(struct work_struct *); bool pending; };
+#define DECLARE_WORK(name, callback) struct work_struct name = {.func = callback}
+struct work_struct *queued_work;
+struct mutex *work_excluded_mutex;
+int work_schedules, work_runs, work_cancels;
+bool run_work_during_cancel;
+bool schedule_work(struct work_struct *work) {
+    if (work->pending) return false;
+    assert(!queued_work); work->pending = true; queued_work = work; ++work_schedules; return true;
+}
+bool cancel_work_sync(struct work_struct *work) {
+    assert(!work_excluded_mutex->held && !atomic_context && !irq_off);
+    ++work_cancels;
+    if (!work->pending) return false;
+    assert(queued_work == work); queued_work = NULL; work->pending = false;
+    /* Model the worker winning dispatch before cancellation can take effect. */
+    if (run_work_during_cancel) { ++work_runs; work->func(work); return false; }
+    return true;
+}
+void run_queued_work(void) {
+    struct work_struct *work = queued_work;
+    if (!work) return;
+    assert(!work_excluded_mutex->held && !atomic_context && !irq_off);
+    queued_work = NULL; work->pending = false; ++work_runs; work->func(work);
+}
+ssize_t vfs_read(struct file *file, char *buffer, size_t bytes, loff_t *position) {
+    return file->f_op->read(file, buffer, bytes, position);
 }
 """
 CASES = r"""
-#define CHECK(x) do { if (!(x)) { fprintf(stderr, "boot events fixture line %d\n", __LINE__); return 1; } } while (0)
+#define CHECK(x) do { if (!(x)) { fprintf(stderr, "boot events fixture line %d: %s\n", __LINE__, #x); return 1; } } while (0)
 static const char original_bytes[] = "ORIGINAL-RC\n";
 struct file_operations native_ops;
 loff_t position;
@@ -168,13 +241,17 @@ ssize_t native_read(struct file *file, char *buffer, size_t count, loff_t *offse
     *offset += bytes; return (ssize_t)bytes;
 }
 static void reset_boot(bool iter) {
+    assert(!queued_work && !event_lifecycle.held && !event_io.held);
     memset(&events, 0, sizeof events);
     events.probe.symbol_name = "vfs_read"; events.probe.pre_handler = boot_read_pre;
     event_lifecycle.held = event_io.held = 0;
+    work_excluded_mutex = &event_lifecycle;
     bridge_module.refs = 0; fs_module.refs = 1; init_task.refs = other_task.refs = 1;
     fixture_current = &init_task; deny_file_ref = module_get_calls = 0;
     probe_error = registrations = removals = atomic_context = irq_off = path_error = 0;
     release_calls = native_calls = use_nested_iter = 0;
+    work_schedules = work_runs = work_cancels = 0;
+    run_work_during_cancel = false;
     copy_limit = native_chunk = SIZE_MAX; native_error = 0; position = 0;
     rc_inode.i_mode = 0100644; rc_inode.i_uid = file_cred.euid = 0;
     rc_inode.size = sizeof original_bytes - 1;
@@ -194,7 +271,9 @@ static int arm(void) {
 }
 static int bind_file(void) {
     struct pt_regs regs = {{(uintptr_t)&rc_file, 0, 0, (uintptr_t)&position}};
-    return events.probe.pre_handler(&events.probe, &regs);
+    int was_atomic = atomic_context; atomic_context = 1;
+    int result = events.probe.pre_handler(&events.probe, &regs);
+    atomic_context = was_atomic; return result;
 }
 static ssize_t read_file(char *buffer, size_t count) {
     if (rc_file.f_op->read) return rc_file.f_op->read(&rc_file, buffer, count, &position);
@@ -211,7 +290,7 @@ static int close_file(bool stop_before_fops_put) {
     }
     fops_put(rc_file.f_op); /* The actual VFS does this after release returns. */
     CHECK(msu_boot_events_stop() == 0 && bridge_module.refs == 0);
-    CHECK(removals == 1 && !events.owner && !events.rc_bytes);
+    CHECK(removals == 1 && !events.owner && !events.rc_bytes && !queued_work);
     return 0;
 }
 static int check_stream(bool iter) {
@@ -223,6 +302,10 @@ static int check_stream(bool iter) {
     CHECK(strstr(events.rc, "sys.boot_completed=1") && !strstr(events.rc, "--boot-event post-mount"));
     CHECK(!strstr(events.rc, "setenforce") && !strstr(events.rc, "setprop ") && !strstr(events.rc, "daemon"));
     CHECK(bind_file() == 0 && rc_file.f_op == &events.proxy && bridge_module.refs == 2 && fs_module.refs == 1);
+    CHECK(events.registered && removals == 0);
+    run_queued_work();
+    CHECK(removals == 1 && !events.registered && work_schedules == 1 && work_runs == 1);
+    CHECK(events.registration_ref && bridge_module.refs == 2 && !queued_work);
     CHECK(msu_boot_events_stop() == -EBUSY && removals == 1 && bridge_module.refs == 2);
     native_chunk = 3;
     for (;;) {
@@ -238,6 +321,24 @@ static int check_stream(bool iter) {
     CHECK(read_file(output, sizeof output) == 0);
     CHECK(close_file(iter) == 0);
     CHECK(arm() == -EALREADY); /* A published proxy is never reused. */
+    return 0;
+}
+static int check_stop_pending_work(bool iter) {
+    reset_boot(iter); CHECK(arm() == 0 && bind_file() == 0);
+    CHECK(queued_work && work_schedules == 1 && !work_runs);
+    CHECK(msu_boot_events_stop() == -EBUSY && removals == 1 && !events.registered);
+    CHECK(!queued_work && work_cancels == 1 && !work_runs && bridge_module.refs == 2);
+    CHECK(rc_file.f_op == &events.proxy && events.registration_ref && events.state == EVENTS_BOUND);
+    run_queued_work(); CHECK(removals == 1 && !work_runs);
+    CHECK(close_file(false) == 0);
+    reset_boot(iter); CHECK(arm() == 0 && bind_file() == 0);
+    run_work_during_cancel = true;
+    CHECK(msu_boot_events_stop() == -EBUSY && removals == 1 && !events.registered);
+    CHECK(!queued_work && work_cancels == 1 && work_runs == 1 && bridge_module.refs == 2);
+    CHECK(close_file(true) == 0);
+    reset_boot(iter); CHECK(arm() == 0);
+    CHECK(msu_boot_events_stop() == 0 && removals == 1 && !queued_work && !work_schedules);
+    CHECK(bridge_module.refs == 0 && init_task.refs == 1);
     return 0;
 }
 static int check_failures(bool iter) {
@@ -265,6 +366,7 @@ static int check_failures(bool iter) {
 static void completed(void) {}
 int main(void) {
     CHECK(check_stream(false) == 0 && check_stream(true) == 0);
+    CHECK(check_stop_pending_work(false) == 0 && check_stop_pending_work(true) == 0);
     CHECK(check_failures(false) == 0 && check_failures(true) == 0);
     for (int which = 0; which < 8; ++which) {
         reset_boot(false); CHECK(arm() == 0);
@@ -278,7 +380,7 @@ int main(void) {
         case 6: path_error = 1; break;
         case 7: fixture_current = &other_task; break;
         }
-        CHECK(bind_file() == 0 && rc_file.f_op == &native_ops && events.state == EVENTS_ARMED);
+        CHECK(bind_file() == 0 && rc_file.f_op == &native_ops && events.state == EVENTS_ARMED && !queued_work);
         fixture_current = &init_task; CHECK(msu_boot_events_stop() == 0 && bridge_module.refs == 0);
     }
     reset_boot(false); struct msu_deployment_namespace_record record = deployment();
@@ -287,9 +389,9 @@ int main(void) {
     record = deployment(); record.name[0] = '/';
     CHECK(msu_boot_events_start(&record) == -EINVAL && !registrations);
     reset_boot(false); probe_error = -EPERM;
-    CHECK(arm() == -EPERM && !events.owner && !events.rc_bytes && bridge_module.refs == 0 && init_task.refs == 1);
+    CHECK(arm() == -EPERM && !events.owner && !events.rc_bytes && bridge_module.refs == 0 && init_task.refs == 1 && !queued_work);
     reset_boot(false); CHECK(arm() == 0); deny_file_ref = 1;
-    CHECK(bind_file() == 0 && rc_file.f_op == &native_ops && bridge_module.refs == 1 && fs_module.refs == 1);
+    CHECK(bind_file() == 0 && rc_file.f_op == &native_ops && bridge_module.refs == 1 && fs_module.refs == 1 && !queued_work);
     CHECK(msu_boot_events_stop() == 0 && bridge_module.refs == 0);
     reset_boot(false); CHECK(arm() == 0 && bind_file() == 0); use_nested_iter = 1;
     char output[64]; CHECK(rc_file.f_op->read_iter == native_iter);
@@ -309,30 +411,25 @@ int main(void) {
 
 class BootEventsChecks(unittest.TestCase):
     def test_native_stream_and_lifetime_fixture(self):
-        selection_data = SELECTION.read_bytes()
-        self.assertEqual(hashlib.sha256(selection_data).hexdigest(), SELECTION_SHA256)
-        rows = {row["logicalPath"]: row["after"] for row in json.loads(selection_data)["files"]}
         originals = {BRIDGE / name: (BRIDGE / name).read_bytes() for name in ("boot_events.c", "boot_events.h")}
-        originals[SELECTION] = selection_data
         headers = {}
         for name in ("manager_deployment_namespace.h", "manager_claim_loader.h"):
-            reference = rows["runtime/ultra/identity/kernel/" + name]
-            path = Path(reference["path"])
+            path = REPO / "runtime/ultra/identity/kernel" / name
             data = path.read_bytes()
-            self.assertEqual(len(data), reference["bytes"])
-            self.assertEqual(hashlib.sha256(data).hexdigest(), reference["sha256"])
             headers[name] = data
             originals[path] = data
         with tempfile.TemporaryDirectory(prefix="bridge-boot-events-") as directory:
             output = Path(directory)
-            for header in ("cred", "dcache", "err", "fs", "irqflags", "kernel", "kprobes", "limits", "module",
-                           "mutex", "pid", "preempt", "sched", "sched/task", "string", "uaccess", "uio"):
+            for header in ("cred", "dcache", "err", "fs", "file", "fcntl", "slab", "irqflags", "kernel", "kprobes", "limits", "module",
+                           "mutex", "pid", "preempt", "sched", "sched/task", "string", "uaccess", "uio", "workqueue"):
                 path = output / "linux" / (header + ".h")
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text("/* kernel mock declarations preincluded */\n")
             path = output / "asm/ptrace.h"
             path.parent.mkdir(exist_ok=True)
             path.write_text("/* ARM64 argument registers mocked */\n")
+            (output / "manager_dynamic_layout.h").write_text("/* focused dynamic field fixture */\n")
+            (output / "preinit.h").write_text("void msu_preinit_release(void);\n")
             for name in ("boot_events.c", "boot_events.h"):
                 (output / name).write_bytes(originals[BRIDGE / name])
             for name, data in headers.items():
@@ -340,9 +437,12 @@ class BootEventsChecks(unittest.TestCase):
             source = output / "fixture.c"
             source.write_text(DEFINITIONS + '\n#include "boot_events.c"\n' + CASES)
             binary = output / "fixture.exe"
+            environment = dict(os.environ)
+            if os.name == "nt":
+                environment["PATH"] = str(Path(CC).resolve().parent) + os.pathsep + environment.get("PATH", "")
             subprocess.run([CC, "-std=gnu11", "-O2", "-Wall", "-Wextra", "-Werror", "-UNDEBUG",
-                            "-I" + str(output), str(source), "-o", str(binary)], check=True, timeout=25)
-            subprocess.run([str(binary)], check=True, timeout=5)
+                            "-I" + str(output), str(source), "-o", str(binary)], check=True, timeout=25, env=environment)
+            subprocess.run([str(binary)], check=True, timeout=5, env=environment)
         for path, data in originals.items():
             self.assertEqual(path.read_bytes(), data, "input changed: " + str(path))
 

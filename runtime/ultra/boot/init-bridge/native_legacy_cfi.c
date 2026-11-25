@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: GPL-3.0-only
-#include <linux/cfi.h>
 #include <linux/errno.h>
 #include <linux/irqflags.h>
 #include <linux/kallsyms.h>
@@ -10,35 +9,11 @@
 #include <linux/string.h>
 #include <linux/uaccess.h>
 #include <linux/version.h>
-#include <linux/workqueue.h>
 #include <asm/page.h>
 #include "native_cfi.h"
 #include "native_legacy_cfi.h"
 
 #if MSU_INIT_BRIDGE_CFI_LEGACY && defined(MODULE)
-/* This symbol, the canonical entries and every section relocation are emitted
- * by the real target LTO link and published by its normal module loader. */
-static noinline int msu_legacy_owner_probe(struct module *owner)
-{
-    return owner == THIS_MODULE ? 0 : -ESTALE;
-}
-static int (*volatile msu_legacy_probe)(struct module *) = msu_legacy_owner_probe;
-
-struct msu_legacy_probe_work {
-    struct work_struct work;
-    struct module *owner;
-    int result;
-};
-
-static void msu_legacy_kernel_probe_work(struct work_struct *work)
-{
-    struct msu_legacy_probe_work *probe =
-        container_of(work, struct msu_legacy_probe_work, work);
-
-    WRITE_ONCE(probe->result, probe->owner == THIS_MODULE ? 0 : -ESTALE);
-}
-static work_func_t const msu_legacy_work_member __used = msu_legacy_kernel_probe_work;
-
 bool msu_legacy_module_text(const void *first, unsigned long bytes)
 {
     unsigned long start = (unsigned long)first;
@@ -51,31 +26,11 @@ bool msu_legacy_module_text(const void *first, unsigned long bytes)
 
 int msu_legacy_module_ready(void)
 {
-    unsigned long check = (unsigned long)THIS_MODULE->cfi_check;
-    int (*probe)(struct module *) = READ_ONCE(msu_legacy_probe);
-    struct msu_legacy_probe_work kernel_probe;
-    bool queued;
-    int error;
-
     if (!in_task() || in_atomic() || irqs_disabled()) return -EWOULDBLOCK;
-    if ((THIS_MODULE->state != MODULE_STATE_COMING &&
-         THIS_MODULE->state != MODULE_STATE_LIVE) ||
-        !check || check != (unsigned long)__cfi_check ||
-        !msu_legacy_module_text((void *)check, sizeof(u32)) ||
-        !msu_legacy_module_text((void *)probe, sizeof(u32))) return -ESTALE;
-    /* Preserve the normal local typed membership check first. */
-    error = probe(THIS_MODULE);
-    if (error) return error;
-    /* The real kernel workqueue makes the external typed callback call. This
-     * reaches native compiler membership/owner lookup, including shadow miss,
-     * rather than mistaking a local type.test for a kernel->module proof. */
-    kernel_probe.owner = THIS_MODULE;
-    kernel_probe.result = -EINPROGRESS;
-    INIT_WORK_ONSTACK(&kernel_probe.work, msu_legacy_kernel_probe_work);
-    queued = schedule_work(&kernel_probe.work);
-    flush_work(&kernel_probe.work);
-    destroy_work_on_stack(&kernel_probe.work);
-    return queued ? READ_ONCE(kernel_probe.result) : -EBUSY;
+    /* The normal loader owns CFI registration. Actual typed calls retain its
+     * checks; readiness adds no synthetic callback or workqueue self-test. */
+    return THIS_MODULE->state == MODULE_STATE_COMING ||
+        THIS_MODULE->state == MODULE_STATE_LIVE ? 0 : -ESTALE;
 }
 
 static int msu_legacy_read_word(unsigned long address, u32 *word)

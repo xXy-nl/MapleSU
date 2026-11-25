@@ -2,6 +2,8 @@
 #ifndef MAPLESU_INIT_BRIDGE_NATIVE_IMPORTS_H
 #define MAPLESU_INIT_BRIDGE_NATIVE_IMPORTS_H
 #include "msu_resolver_build_config.h"
+#include "native_cfi.h"
+#include "native_direct.h"
 #include <linux/fs.h>
 #include <linux/rwsem.h>
 #include <linux/fsnotify_backend.h>
@@ -11,6 +13,7 @@
 #include <linux/nsproxy.h>
 #include <linux/mutex.h>
 #include <linux/cred.h>
+#include <linux/user_namespace.h>
 #include <linux/kernel.h>
 #include <linux/pid_namespace.h>
 #include <linux/sched/user.h>
@@ -28,7 +31,11 @@
 #include <linux/security.h>
 #include <linux/workqueue.h>
 #include <linux/xattr.h>
+#if __has_include(<crypto/sha2.h>)
 #include <crypto/sha2.h>
+#else
+#include <crypto/sha.h>
+#endif
 #include <asm/cacheflush.h>
 #if __has_include(<linux/execmem.h>)
 #include <linux/execmem.h>
@@ -52,10 +59,10 @@ extern ssize_t (*msu_native_procattr_marker)(struct file *, const char __user *,
 /* Native functions used by the selected HOST/SDK TUs which are outside this
  * target's module-export contract. Keep their actual declarations and typed
  * CFI-qualified pointers; no synthetic export or CRC is introduced. */
-extern typeof(&__module_text_address) msu_native___module_text_address;
 #if defined(MSU_MANAGEMENT_RESIDENT_TEXT_OWNER) && MSU_MANAGEMENT_RESIDENT_TEXT_OWNER
 extern typeof(&__module_address) msu_native___module_address;
 #endif
+extern typeof(&__module_text_address) msu_native___module_text_address;
 extern typeof(&__vfs_getxattr) msu_native___vfs_getxattr;
 extern typeof(&abort_creds) msu_native_abort_creds;
 extern typeof(&commit_creds) msu_native_commit_creds;
@@ -66,6 +73,7 @@ extern typeof(&is_subdir) msu_native_is_subdir;
 extern typeof(&putname) msu_native_putname;
 extern typeof(&schedule_on_each_cpu) msu_native_schedule_on_each_cpu;
 extern typeof(&security_cred_getsecid) msu_native_security_cred_getsecid;
+extern typeof(&security_secctx_to_secid) msu_native_security_secctx_to_secid;
 extern typeof(&set_groups) msu_native_set_groups;
 extern typeof(&sha256) msu_native_sha256;
 extern typeof(&vfs_getxattr) msu_native_vfs_getxattr;
@@ -108,14 +116,15 @@ extern typeof(&fsnotify_get_group) msu_native_fsnotify_get_group;
 extern typeof(&fsnotify_destroy_group) msu_native_fsnotify_destroy_group;
 extern typeof(&fsnotify_wait_marks_destroyed) msu_native_fsnotify_wait_marks_destroyed;
 extern typeof(&init_cred) msu_native_init_cred;
+extern typeof(&init_user_ns) msu_native_init_user_ns;
 extern typeof(&vfs_write) msu_native_vfs_write;
 extern typeof(&alloc_uid) msu_native_alloc_uid;
+#if MSU_MANAGEMENT_CRED_UCOUNTS
 extern typeof(&set_cred_ucounts) msu_native_set_cred_ucounts;
+#endif
 extern typeof(&core_kernel_text) msu_native_core_kernel_text;
 extern typeof(&sync_icache_aliases) msu_native_sync_icache_aliases;
 extern struct tracepoint *msu_native_trace_exec, *msu_native_trace_exit;
-struct seccomp_filter;
-extern void (*msu_native_seccomp_release)(struct seccomp_filter *filter);
 #ifdef CONFIG_SECCOMP_FILTER
 extern typeof(&seccomp_filter_release) msu_native_seccomp_filter_release;
 #endif
@@ -152,10 +161,10 @@ static inline void msu_init_bridge_put_nsproxy(struct nsproxy *ns)
 #define aarch64_insn_patch_text msu_native_patch_text
 #define text_mutex (*msu_native_text_mutex)
 #define proc_pid_attr_write (*msu_native_procattr_marker)
-#define __module_text_address (*msu_native___module_text_address)
 #if defined(MSU_MANAGEMENT_RESIDENT_TEXT_OWNER) && MSU_MANAGEMENT_RESIDENT_TEXT_OWNER
 #define __module_address (*msu_native___module_address)
 #endif
+#define __module_text_address (*msu_native___module_text_address)
 #define __vfs_getxattr (*msu_native___vfs_getxattr)
 #define abort_creds (*msu_native_abort_creds)
 #define commit_creds (*msu_native_commit_creds)
@@ -166,6 +175,7 @@ static inline void msu_init_bridge_put_nsproxy(struct nsproxy *ns)
 #define putname (*msu_native_putname)
 #define schedule_on_each_cpu (*msu_native_schedule_on_each_cpu)
 #define security_cred_getsecid (*msu_native_security_cred_getsecid)
+#define security_secctx_to_secid (*msu_native_security_secctx_to_secid)
 #define set_groups (*msu_native_set_groups)
 #define vfs_getxattr (*msu_native_vfs_getxattr)
 #define vfs_setxattr (*msu_native_vfs_setxattr)
@@ -204,14 +214,16 @@ static inline void msu_init_bridge_put_nsproxy(struct nsproxy *ns)
 #define fsnotify_destroy_group (*msu_native_fsnotify_destroy_group)
 #define fsnotify_wait_marks_destroyed (*msu_native_fsnotify_wait_marks_destroyed)
 #define init_cred (*msu_native_init_cred)
+#define init_user_ns (*msu_native_init_user_ns)
 #define vfs_write (*msu_native_vfs_write)
 #define alloc_uid (*msu_native_alloc_uid)
+#if MSU_MANAGEMENT_CRED_UCOUNTS
 #define set_cred_ucounts (*msu_native_set_cred_ucounts)
+#endif
 #define core_kernel_text (*msu_native_core_kernel_text)
 #define sync_icache_aliases (*msu_native_sync_icache_aliases)
 #define __tracepoint_sched_process_exec (*msu_native_trace_exec)
 #define __tracepoint_sched_process_exit (*msu_native_trace_exit)
-#define __seccomp_filter_release (*msu_native_seccomp_release)
 #ifdef CONFIG_SECCOMP_FILTER
 #define seccomp_filter_release (*msu_native_seccomp_filter_release)
 #endif

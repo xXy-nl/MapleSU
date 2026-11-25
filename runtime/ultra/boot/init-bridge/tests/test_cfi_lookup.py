@@ -31,8 +31,10 @@ DEFINITIONS = r"""
 #define KSYM_SYMBOL_LEN 256
 struct kprobe { const char *symbol_name; void *addr; };
 uintptr_t kallsyms_lookup_name(const char *name);
+int kallsyms_lookup_size_offset(uintptr_t address, uintptr_t *bytes, uintptr_t *offset);
 int task_ok = 1, atomic_context, irq_off, probe_error, probes, removed, calls;
 int read_error, self_mismatch;
+int fixture_size_mode;
 uintptr_t probe_address;
 unsigned int entry_instruction = 0xd503245f;
 const char *symbol_text = "kallsyms_lookup_name+0/0x40";
@@ -55,15 +57,23 @@ long copy_from_kernel_nofault(void *to, const void *from, size_t bytes) {
     if (bytes != sizeof entry_instruction) return -EINVAL;
     memcpy(to, &entry_instruction, bytes); return 0;
 }
+__attribute__((aligned(16),__noinline__)) int fixture_symbol_size(uintptr_t address, uintptr_t *bytes, uintptr_t *offset) {
+    *bytes = fixture_size_mode == 1 ? 0 : fixture_size_mode == 3 ? UINTPTR_MAX : 64;
+    *offset = fixture_size_mode == 2 ? 4 : 0;
+    (void)address; return fixture_size_mode == 4 ? 0 : 1;
+}
 __attribute__((aligned(16),__noinline__)) uintptr_t fixture_lookup(const char *name) {
-    (void)name; ++calls; return (uintptr_t)fixture_lookup + self_mismatch * 4;
+    ++calls;
+    if (!strcmp(name, "kallsyms_lookup_size_offset")) return (uintptr_t)fixture_symbol_size;
+    if (!strcmp(name, "missing")) return 0;
+    return (uintptr_t)fixture_lookup + self_mismatch * 4;
 }
 """
 CASES = r"""
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "lookup fixture line %d\n", __LINE__); return 1; } } while (0)
 void reset_fixture(void) {
     native_lookup = NULL; task_ok = 1; atomic_context = irq_off = probe_error = 0;
-    probes = removed = calls = read_error = self_mismatch = 0;
+    probes = removed = calls = read_error = self_mismatch = fixture_size_mode = 0;
     probe_address = (uintptr_t)fixture_lookup; entry_instruction = 0xd503245f;
     symbol_text = "kallsyms_lookup_name+0/0x40";
 }
@@ -91,6 +101,17 @@ int main(void) {
     CHECK(msu_init_bridge_lookup_init() == 0 && probes == 1 && removed == 1 && calls == 1);
     CHECK(msu_init_bridge_lookup_init() == -EALREADY && probes == 1);
     CHECK(msu_init_bridge_resolve_cfi("callable", reference, &resolved) == 0 && resolved == (uintptr_t)fixture_lookup);
+    {
+        uintptr_t address = 123, bytes = 456;
+        CHECK(msu_init_bridge_lookup_size("callable", &address, &bytes) == 0 &&
+            address == (uintptr_t)fixture_lookup && bytes == 64);
+        address = 123; bytes = 456;
+        CHECK(msu_init_bridge_lookup_size("missing", &address, &bytes) == -ENOENT && address == 123 && bytes == 456);
+        CHECK(msu_init_bridge_lookup_size(NULL, &address, &bytes) == -EINVAL && address == 123 && bytes == 456);
+        for (fixture_size_mode = 1; fixture_size_mode <= 4; ++fixture_size_mode) {
+            CHECK(msu_init_bridge_lookup_size("callable", &address, &bytes) == -EOPNOTSUPP && address == 123 && bytes == 456);
+        }
+    }
     reset_fixture(); probe_address += 4; symbol_text = "kallsyms_lookup_name+0x4/0x40";
     CHECK(msu_init_bridge_lookup_init() == 0 && calls == 1 && removed == 1);
     reset_fixture(); probe_address += 4; symbol_text = "kallsyms_lookup_name+0x4/0x40"; read_error = 1;

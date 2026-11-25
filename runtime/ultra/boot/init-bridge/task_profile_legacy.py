@@ -131,20 +131,58 @@ def trace_registration(api, model, name, canonical):
     return proofs
 
 
+def callback_machine_abi(signature):
+    """Project only simple pointer/64-bit integer parameters of the real module BTF.
+
+    This discards pointee names and integer signedness deliberately: target
+    instructions establish register transport, not a semantic C declaration.
+    """
+    import re
+    if not signature.startswith("*fv(") or not signature.endswith(";)"):
+        return None
+    arguments = signature[4:-1].split(";")
+    if arguments[-1] != "":
+        return None
+    arguments = arguments[:-1]
+    if len(arguments) != 3 or any(not re.fullmatch(r"(?:\*+(?:v|s[A-Za-z_][A-Za-z_0-9]*|i[1-8]:[0-9]+)|i8:[0-9]+)", arg)
+            for arg in arguments):
+        return None
+    return dict(pcs="aapcs64", argumentRegisters=["x0", "x1", "x2"], argumentBytes=[8, 8, 8])
+
+
 def task_member(api, model, contract, name, callsites, target, functions, canonical):
     unchecked = [row for row in callsites if row.get("cfiMode") == "unchecked-native-callsite"]
     if not unchecked:
         return model.member(name, callsites)
     if (len(callsites) != 1 or name != "msu_task_profile_sys_enter" or
-            "typeIdHex" in unchecked[0] or unchecked[0].get("proof") !=
-            "actual-symbol-bounded-uninstrumented-trace-loop-and-btf" or
-            unchecked[0].get("callbackSignature") != functions[name]["signature"] or
+            "typeIdHex" in unchecked[0] or
             target["taskProfileCallerTypeSets"].get(unchecked[0]["caller"]) != []):
         api.fail("UNCHECKED_TRACE_CALLBACK_ABI:" + name)
+    fact = unchecked[0]
+    if fact.get("proof") == "actual-symbol-bounded-uninstrumented-trace-loop-and-btf":
+        if fact.get("callbackSignature") != functions[name]["signature"]:
+            api.fail("UNCHECKED_TRACE_CALLBACK_ABI:" + name)
+        return dict(symbol=name, cfiMode="unchecked-native-callsite",
+            callbackSignature=functions[name]["signature"],
+            proof="actual-native-unchecked-trace-callsite-not-cfi-membership",
+            registration=trace_registration(api, model, name, canonical), runtimeOwnerQualified=False)
+    if (fact.get("proof") != "actual-symbol-bounded-uninstrumented-trace-loop-and-registration-writer" or
+            fact.get("caller") != "__traceiter_sys_enter" or fact.get("btfAvailable") is not False or
+            fact.get("machineAbiQualified") is not True or
+            any(fact.get(key) is not False for key in ("targetSemanticSignatureQualified", "targetCfiTypeIdQualified",
+                "runtimeOwnerQualified", "deviceQualified")) or
+            any(key in fact for key in ("callbackSignature", "iteratorSignature", "btfSha256")) or
+            not fact.get("registrationWriter") or callback_machine_abi(functions[name]["signature"]) is None or
+            {key: fact.get("callbackMachineAbi", {}).get(key) for key in ("pcs", "argumentRegisters", "argumentBytes")} !=
+            callback_machine_abi(functions[name]["signature"]) or
+            fact.get("callbackMachineAbi", {}).get("argumentSources") != ["record-data", "iterator-x1", "iterator-x2"] or
+            fact.get("callbackMachineAbi", {}).get("returnValueUsed") is not False):
+        api.fail("UNCHECKED_TRACE_CALLBACK_ABI:" + name)
     return dict(symbol=name, cfiMode="unchecked-native-callsite",
-        callbackSignature=functions[name]["signature"],
-        proof="actual-native-unchecked-trace-callsite-not-cfi-membership",
-        registration=trace_registration(api, model, name, canonical), runtimeOwnerQualified=False)
+        moduleCallbackSignature=functions[name]["signature"], callbackMachineAbi=fact["callbackMachineAbi"],
+        proof="actual-native-unchecked-trace-machine-abi-not-semantic-or-cfi-membership",
+        registration=trace_registration(api, model, name, canonical), machineAbiQualified=True,
+        targetSemanticSignatureQualified=False, targetCfiTypeIdQualified=False, runtimeOwnerQualified=False)
 
 
 def legacy_proof(api, data, target, functions):
@@ -155,8 +193,8 @@ def legacy_proof(api, data, target, functions):
     owner = model.symbol("__this_module")
     if owner["st_info"]["type"] != "STT_OBJECT" or owner["st_size"] <= 0:
         api.fail("LEGACY_NORMAL_MODULE_OWNER")
-    # The existing normal-module route proves init and real kernel workqueue
-    # callbacks too; static membership never claims module/shadow publication.
+    # Retain the actual native init consumer; requested callbacks are checked
+    # below. Static membership never claims module/shadow publication.
     normal = contract.verify_module(data, target)
     members = {}
     for name in api.CALLBACKS:
@@ -260,6 +298,7 @@ def verify_provenance(api, report, bridge, selection, build, config):
             not any(target_config.get(key) == "y" for key in ("CONFIG_CFI", "CONFIG_CFI_CLANG")) or
             any(target_config.get(key, "n") != build_config.get(key, "n") for key in LOCK_CONFIG)):
         api.fail("LEGACY_ACTUAL_CFI_POLICY")
+    api.package.verify_module_debug_source(provenance, bridge, build)
     verify_module(api, bridge.read_bytes(), report)
 
 
@@ -337,9 +376,12 @@ def main(api):
     derived, probe = output / "task-profile-btf.elf", output / "native-probe-btf.elf"
     native = paths["nativeProbeObject"]
     native_elf = native.read_bytes().startswith(b"\x7fELF")
-    carrier = native if native_elf else bridge
+    debug_source = api.package.module_debug_source(bridge, paths["strictBuild"])
+    paths["moduleDebugSource"] = debug_source
+    before["moduleDebugSource"] = api.package.file_identity(debug_source)
+    carrier = native if native_elf else debug_source
     derivations = []
-    for source, destination in ((bridge, derived), (carrier, probe)):
+    for source, destination in ((debug_source, derived), (carrier, probe)):
         shutil.copyfile(source, destination)
         for argv in ([str(args.llvm_objcopy), "--decompress-debug-sections", str(destination)],
                 [str(args.pahole), "-J", "--btf_features_strict=var,global_var", str(destination)]):

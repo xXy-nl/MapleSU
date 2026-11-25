@@ -130,8 +130,7 @@ def collect(path, commands, page_bytes):
             "commands": [command_policy(command) for command in commands],
             "checker": {"symbol": checker.name, "section": elf.get_section(checker["st_shndx"]).name,
                         "offset": checker["st_value"], "bytes": checker["st_size"]},
-            "typedPointers": [pointer_member(name) for name in
-                              ("msu_legacy_probe", "msu_legacy_work_member", "msu_sdk_legacy_call")],
+            "typedPointers": [pointer_member("msu_sdk_legacy_call")],
             "carrier": {"section": carrier.name, "offset": start, "metadataOffset": metadata,
                         "bytes": end - start, "pageBytes": page_bytes,
                         "keyMetadataDisplacement": metadata - blr},

@@ -15,7 +15,7 @@ import tempfile
 import unittest
 
 BRIDGE = Path(__file__).resolve().parents[1]
-REPO = BRIDGE.parents[6]
+REPO = BRIDGE.parents[3]
 SELECTION = REPO / ".tmp/p2-host-final-20261118/core-builder/deployment54/HOST-DEPLOYMENT-SOURCE-SELECTION.json"
 SELECTION_SHA256 = "34058fd92ddd84a1a7f6d678fae4239f142c028fdc583dd56b78df2b38b671a1"
 CC = os.environ.get("BRIDGE_FIXTURE_CC", "C:/msys64/ucrt64/bin/gcc.exe")
@@ -43,6 +43,12 @@ SHIMS = r"""
 #define WARN_ON_ONCE(x) ((void)(x))
 #define pr_err(...) ((void)0)
 #define pr_info(...) ((void)0)
+#define pr_warn(...) ((void)0)
+#define READ_ONCE(value) (value)
+#define MSU_DYN_FIELD(task, owner, member) fixture_pid
+static int msu_runtime_layout_ready(void) { return 1; }
+int msu_preinit_start(void) { return 0; }
+void msu_preinit_release(void) {}
 int fixture_pid = 1, pinned;
 #define current ((void *)0)
 int task_pid_nr(const void *task) { (void)task; return fixture_pid; }
@@ -53,11 +59,13 @@ void memzero_explicit(void *value, size_t bytes) {
 }
 #define MSU_BOOT_SDK_KEY_BYTES 48
 #define MSU_BOOT_SDK_ALLOCATOR_NOPROF 1
+#define MSU_BOOT_SDK_ALLOCATOR_INNER 2
+#define MSU_BOOT_SDK_ALLOCATOR_SEGMENTED 8
 struct msu_boot_sdk_layout { unsigned int environment; };
 int msu_init_bridge_imports_init(void);
 int msu_init_bridge_lookup_init(void);
 unsigned long msu_init_bridge_checked_lookup(const char *name);
-int msu_init_bridge_native_layout(unsigned int flags, int environment, struct msu_boot_sdk_layout *layout);
+int msu_init_bridge_native_layout(unsigned int flags, unsigned int execmem_free, struct msu_boot_sdk_layout *layout);
 int msu_boot_sdk_native_start(const struct msu_boot_sdk_layout *layout, const char key[48]);
 int msu_boot_sdk_native_abort(void);
 """
@@ -71,8 +79,8 @@ static const char valid_namespace[] = "aB3dE6gH9jK2mN5p";
 int msu_init_bridge_lookup_init(void) { ++lookups; return 0; }
 int msu_init_bridge_imports_init(void) { return 0; }
 unsigned long msu_init_bridge_checked_lookup(const char *name) { (void)name; return 1; }
-int msu_init_bridge_native_layout(unsigned int flags, int environment, struct msu_boot_sdk_layout *layout) {
-    (void)flags; layout->environment = environment; phase = 1; return layout_error;
+int msu_init_bridge_native_layout(unsigned int flags, unsigned int execmem_free, struct msu_boot_sdk_layout *layout) {
+    (void)flags; if (execmem_free != 0) host_invalid = 1; layout->environment = 1; phase = 1; return layout_error;
 }
 int msu_manager_resident_init(const struct msu_resident_config *config) {
     ++host_calls; config_version = config->version;
@@ -130,7 +138,7 @@ static int cleared(void) {
 int main(void) {
     reset_fixture();
     CHECK(msu_init_bridge_start() == 0 && config_version == 2 && !host_invalid);
-    CHECK(lookups == 1 && host_calls == 1 && provider_calls == 1 && environment_seen == 0);
+    CHECK(lookups == 1 && host_calls == 1 && provider_calls == 1 && environment_seen == 1);
     CHECK(event_calls == 1 && !event_stops && !native_aborts && pinned == 1);
     CHECK(cleared() && held.magic == MSU_DEPLOYMENT_NAMESPACE_MAGIC && held.schema == 1 && held.bytes == 24);
     CHECK(!memcmp(held.name, valid_namespace, 16) && msu_deployment_namespace_valid(&held));
@@ -199,7 +207,8 @@ class NamespaceChecks(unittest.TestCase):
                 path = output / "linux" / (name + ".h")
                 path.parent.mkdir(exist_ok=True)
                 path.write_text("/* explicit host fixture kernel declarations */\n")
-            for name in ("native_imports.h", "native_layout.h", "native_lookup.h", "native_sdk.h"):
+            for name in ("native_imports.h", "native_layout.h", "native_lookup.h", "native_sdk.h",
+                         "manager_dynamic_layout.h", "preinit.h"):
                 (output / name).write_text("/* fixture provider declarations are preincluded */\n")
             (output / "boot_events.h").write_bytes(originals[BRIDGE / "boot_events.h"])
             for name, data in headers.items():

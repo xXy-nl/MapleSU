@@ -19,10 +19,41 @@
 #include <linux/string.h>
 #include <linux/uaccess.h>
 #include <linux/uio.h>
+#include <linux/workqueue.h>
 #include <asm/ptrace.h>
 #include "manager_dynamic_layout.h"
 #include "boot_events.h"
+#ifndef MSU_BOOT_EVENTS_RAW_RESIDENT
+#define MSU_BOOT_EVENTS_RAW_RESIDENT 0
+#endif
+#if MSU_BOOT_EVENTS_RAW_RESIDENT
+#include "manager_resident_abi.h"
+
+/* The raw carrier verifies every embedded native object and every directly
+ * accessed callback/iterator/register member against the input Image BTF. */
+#define MSU_BOOT_ABI_MEMBER(type, member) \
+    offsetof(struct type, member), sizeof(((struct type *)0)->member)
+const u32 msu_boot_events_abi_words[] __used __section(".msu.boot_events.abi") = {
+    0x4d534245U, 1, 152, 1,
+    sizeof(struct file_operations), __alignof__(struct file_operations),
+    MSU_BOOT_ABI_MEMBER(file_operations, owner), MSU_BOOT_ABI_MEMBER(file_operations, read),
+    MSU_BOOT_ABI_MEMBER(file_operations, read_iter), MSU_BOOT_ABI_MEMBER(file_operations, release),
+    sizeof(struct kprobe), __alignof__(struct kprobe),
+    MSU_BOOT_ABI_MEMBER(kprobe, symbol_name), MSU_BOOT_ABI_MEMBER(kprobe, pre_handler),
+    sizeof(struct kiocb), __alignof__(struct kiocb),
+    MSU_BOOT_ABI_MEMBER(kiocb, ki_filp), MSU_BOOT_ABI_MEMBER(kiocb, ki_pos),
+    MSU_BOOT_ABI_MEMBER(kiocb, ki_complete), MSU_BOOT_ABI_MEMBER(kiocb, ki_flags),
+    sizeof(struct iov_iter), __alignof__(struct iov_iter), MSU_BOOT_ABI_MEMBER(iov_iter, count),
+    sizeof(struct pt_regs), __alignof__(struct pt_regs), MSU_BOOT_ABI_MEMBER(pt_regs, regs),
+};
+#undef MSU_BOOT_ABI_MEMBER
+_Static_assert(sizeof(msu_boot_events_abi_words) == 152, "boot events native ABI words");
+/* A typed native import also binds the vfs_read argument contract used below;
+ * the symbol-name string alone would not carry that proof. */
+static typeof(&vfs_read) msu_boot_native_vfs_read __used = vfs_read;
+#else
 #include "preinit.h"
+#endif
 
 #ifndef CONFIG_ARM64
 #error "Ultra init boot events require the target ARM64 calling convention"
@@ -64,6 +95,62 @@ static struct {
 } events = { .probe = { .symbol_name = "vfs_read", .pre_handler = boot_read_pre } };
 static DEFINE_MUTEX(event_lifecycle);
 static DEFINE_MUTEX(event_io);
+
+static void boot_remove_probe(struct work_struct *work)
+{
+    (void)work;
+    mutex_lock(&event_lifecycle);
+    if (events.registered) {
+        unregister_kprobe(&events.probe);
+        events.registered = false;
+    }
+    mutex_unlock(&event_lifecycle);
+}
+static DECLARE_WORK(boot_remove_work, boot_remove_probe);
+
+#if MSU_BOOT_EVENTS_RAW_RESIDENT
+static struct {
+    const struct msu_resident_slot *slot;
+    const void *memory;
+    u64 allocation_bytes;
+} boot_resident;
+
+int msu_boot_events_bind_boot_resident(const struct msu_resident_slot *slot,
+    const void *memory, u64 allocation_bytes)
+{
+    unsigned long start = (unsigned long)memory, end;
+    unsigned long code = (unsigned long)msu_boot_events_bind_boot_resident;
+    unsigned long data = (unsigned long)&events;
+    unsigned long owner = (unsigned long)&boot_resident;
+    if (!msu_runtime_layout_ready()) return -EAGAIN;
+    if (!slot || ((unsigned long)slot & 63U) || !memory ||
+        allocation_bytes < sizeof(events) || allocation_bytes < sizeof(boot_resident) ||
+        allocation_bytes > ~0UL - start) return -EINVAL;
+    end = start + allocation_bytes;
+    if (code < start || code >= end || data < start || data > end - sizeof(events) ||
+        owner < start || owner > end - sizeof(boot_resident) ||
+        ((unsigned long)slot >= start && (unsigned long)slot < end)) return -EINVAL;
+    if (smp_load_acquire(&slot->boot_magic) != MSU_RESIDENT_BOOT_MAGIC ||
+        smp_load_acquire(&slot->state) != MSU_RESIDENT_INITIALIZING ||
+        READ_ONCE(slot->memory) || READ_ONCE(slot->allocation_bytes)) return -ESTALE;
+    if (boot_resident.slot)
+        return boot_resident.slot == slot && boot_resident.memory == memory &&
+            boot_resident.allocation_bytes == allocation_bytes ? 0 : -ESTALE;
+    boot_resident.slot = slot;
+    boot_resident.memory = memory;
+    boot_resident.allocation_bytes = allocation_bytes;
+    return 0;
+}
+
+static bool boot_resident_ready(void)
+{
+    return boot_resident.slot &&
+        smp_load_acquire(&boot_resident.slot->boot_magic) == MSU_RESIDENT_BOOT_MAGIC &&
+        smp_load_acquire(&boot_resident.slot->state) == MSU_RESIDENT_READY &&
+        READ_ONCE(boot_resident.slot->memory) == (unsigned long)boot_resident.memory &&
+        READ_ONCE(boot_resident.slot->allocation_bytes) == boot_resident.allocation_bytes;
+}
+#endif
 
 _Static_assert(__builtin_types_compatible_p(typeof(&boot_read),
     typeof(((struct file_operations *)0)->read)), "native read callback");
@@ -268,7 +355,8 @@ static int boot_release(struct inode *inode, struct file *file)
 
     /* VFS invokes release only after the last file reference: no read can still
      * be entered or waiting to branch into this proxy. Keep proxy.owner intact;
-     * normal __fput drops its module reference AFTER this callback returns. */
+     * LKM __fput drops its module reference after this callback returns. A raw
+     * proxy is backed by the permanent matching READY Image allocation. */
     mutex_lock(&event_io);
     if (events.original->release) result = events.original->release(inode, file);
     kvfree(events.module_rc);
@@ -293,6 +381,12 @@ static int boot_read_pre(struct kprobe *probe, struct pt_regs *regs)
     (void)probe;
     if (current != events.owner || READ_ONCE(MSU_DYN_FIELD(current, task_struct, pid)) != 1 ||
         smp_load_acquire(&events.state) != EVENTS_ARMED) return 0;
+#if MSU_BOOT_EVENTS_RAW_RESIDENT
+    /* Registration precedes userspace init. Only the permanently boot-owned
+     * READY allocation may publish fops: a failed constructor remains fully
+     * drainable by unregister_kprobe before its Image retirement frees it. */
+    if (!boot_resident_ready()) return 0;
+#endif
     file = (struct file *)regs_get_kernel_argument(regs, 0);
     position = (loff_t *)regs_get_kernel_argument(regs, 3);
     if (!file || !position || *position || msu_init_bridge_file_count(file) != 1 ||
@@ -304,7 +398,9 @@ static int boot_read_pre(struct kprobe *probe, struct pt_regs *regs)
     resolved = d_path(&MSU_DYN_FIELD(file, file, f_path), path, sizeof(path));
     if (IS_ERR(resolved) || strcmp(resolved, "/system/etc/init/hw/init.rc")) return 0;
     /* Init has reached rc parsing: no later exec may consume an unused blob. */
+#if !MSU_BOOT_EVENTS_RAW_RESIDENT
     msu_preinit_release();
+#endif
     size = READ_ONCE(MSU_DYN_FIELD(inode, inode, i_size));
     original = READ_ONCE(MSU_DYN_FIELD(file, file, f_op));
     if (size < 0 || size > S64_MAX - MSU_BOOT_RC_BYTES - MSU_MODULE_RC_BYTES || !original ||
@@ -314,7 +410,13 @@ static int boot_read_pre(struct kprobe *probe, struct pt_regs *regs)
     /* No allocation/sleep in the probe. The native file's existing original
      * fops reference is transferred to events.original until proxy release. */
     events.proxy = *original;
+#if MSU_BOOT_EVENTS_RAW_RESIDENT
+    /* This is a raw Image allocation, not an LKM. The matching READY slot
+     * owns all callback code/data, including the release return tail. */
+    events.proxy.owner = NULL;
+#else
     events.proxy.owner = THIS_MODULE;
+#endif
     /* vfs_read selects read first, otherwise its synchronous read_iter path.
      * Intercept only that choice: an original read may call read_iter itself. */
     if (original->read) events.proxy.read = boot_read;
@@ -334,6 +436,9 @@ static int boot_read_pre(struct kprobe *probe, struct pt_regs *regs)
      * Original owner refs and all copied native operations remain valid. */
     smp_store_release(&events.state, EVENTS_BOUND);
     WRITE_ONCE(MSU_DYN_FIELD(file, file, f_op), &events.proxy);
+    /* unregister_kprobe sleeps: retire this one-shot probe outside its handler.
+     * The file's fops owner and registration_ref retain separate lifetimes. */
+    schedule_work(&boot_remove_work);
     return 0;
 }
 
@@ -345,6 +450,12 @@ int msu_boot_events_start(const struct msu_deployment_namespace_record *deployme
     if (!in_task() || in_atomic() || irqs_disabled()) return -EWOULDBLOCK;
     if (READ_ONCE(MSU_DYN_FIELD(current, task_struct, pid)) != 1) return -EPERM;
     if (!msu_deployment_namespace_valid(deployment)) return -EINVAL;
+#if MSU_BOOT_EVENTS_RAW_RESIDENT
+    if (!boot_resident.slot ||
+        smp_load_acquire(&boot_resident.slot->state) != MSU_RESIDENT_INITIALIZING ||
+        READ_ONCE(boot_resident.slot->memory) || READ_ONCE(boot_resident.slot->allocation_bytes))
+        return -ENODEV;
+#endif
     bytes = snprintf(helper, sizeof(helper), "/data/%.*s/init",
         (int)sizeof(deployment->name), (const char *)deployment->name);
     if (bytes != (int)sizeof(helper) - 1) return -EOVERFLOW;
@@ -362,15 +473,19 @@ int msu_boot_events_start(const struct msu_deployment_namespace_record *deployme
     events.rc_bytes = bytes;
     msu_dynamic_get_task_struct(current);
     events.owner = current;
+#if !MSU_BOOT_EVENTS_RAW_RESIDENT
     if (!try_module_get(THIS_MODULE)) { error = -ENODEV; goto owner; }
     events.registration_ref = true;
+#endif
     smp_store_release(&events.state, EVENTS_ARMED);
     events.started = true;
     error = register_kprobe(&events.probe);
     if (error) {
         smp_store_release(&events.state, EVENTS_OFF);
+#if !MSU_BOOT_EVENTS_RAW_RESIDENT
         events.registration_ref = false;
         module_put(THIS_MODULE);
+#endif
         goto owner;
     }
     events.registered = true;
@@ -392,12 +507,19 @@ int msu_boot_events_stop(void)
     int error = 0;
 
     if (!in_task() || in_atomic() || irqs_disabled()) return -EWOULDBLOCK;
+#if !MSU_BOOT_EVENTS_RAW_RESIDENT
     msu_preinit_release();
+#endif
     mutex_lock(&event_lifecycle);
     if (events.registered) {
         unregister_kprobe(&events.probe);
         events.registered = false;
     }
+    mutex_unlock(&event_lifecycle);
+    /* unregister drains handlers before cancellation, so no producer can queue
+     * new work afterward. The worker takes event_lifecycle: never wait under it. */
+    cancel_work_sync(&boot_remove_work);
+    mutex_lock(&event_lifecycle);
     if (smp_load_acquire(&events.state) == EVENTS_BOUND) {
         error = -EBUSY;
         goto out;
@@ -415,7 +537,9 @@ int msu_boot_events_stop(void)
     mutex_unlock(&event_io);
     if (events.registration_ref) {
         events.registration_ref = false;
+#if !MSU_BOOT_EVENTS_RAW_RESIDENT
         module_put(THIS_MODULE);
+#endif
     }
 out:
     mutex_unlock(&event_lifecycle);

@@ -81,6 +81,35 @@ int msu_init_bridge_resolve_cfi(const char *name, const void *prototype,
 #endif
 }
 
+static noinline int native_size_prototype(unsigned long address,
+    unsigned long *bytes, unsigned long *offset)
+{
+    (void)address; (void)bytes; (void)offset;
+    return 0;
+}
+_Static_assert(__builtin_types_compatible_p(typeof(&native_size_prototype),
+    typeof(&kallsyms_lookup_size_offset)), "target symbol size prototype");
+
+int msu_init_bridge_lookup_size(const char *name, unsigned long *address,
+    unsigned long *bytes)
+{
+    typeof(&kallsyms_lookup_size_offset) size_of;
+    unsigned long entry, function, size = 0, offset = 0;
+    int error;
+
+    if (!name || !*name || !address || !bytes) return -EINVAL;
+    entry = msu_init_bridge_lookup(name);
+    if (!entry) return -ENOENT;
+    error = msu_init_bridge_resolve_cfi("kallsyms_lookup_size_offset",
+        (void *)native_size_prototype, &function);
+    if (error) return error;
+    size_of = (typeof(size_of))function;
+    if (!size_of(entry, &size, &offset) || offset || !size || size > ~0UL - entry)
+        return -EOPNOTSUPP;
+    *address = entry; *bytes = size;
+    return 0;
+}
+
 #if MSU_INIT_BRIDGE_CFI_NONE
 static unsigned long native_symbol_entry(unsigned long address)
 {

@@ -5,6 +5,7 @@ These are structural/loading-input checks, never a claim of cold-boot/SU
 qualification. Uses pyelftools, already used by the current host builder.
 """
 import argparse
+from collections import Counter
 import hashlib
 import importlib.util
 import io
@@ -68,6 +69,20 @@ def python_dependency(args):
 
 def kmi_api():
     spec = importlib.util.spec_from_file_location("bridge_target_kmi", Path(__file__).with_name("target_kmi.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def legacy_direct_api():
+    spec = importlib.util.spec_from_file_location("bridge_legacy_direct", Path(__file__).with_name("legacy_direct.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def compiled_native_layouts_api():
+    spec = importlib.util.spec_from_file_location("bridge_compiled_native_layouts", Path(__file__).with_name("compiled_native_layouts.py"))
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -193,7 +208,15 @@ def inspect_module(data, release, config, symvers, target_contract=None):
         exported[fields[1]] = (int(fields[0], 16), fields[2], fields[3], fields[4] if len(fields) > 4 else "")
     if not exported:
         raise ValueError("ULTRA_BRIDGE_SYMVERS_EMPTY")
-    needed = imports | ({"module_layout"} if config.get("CONFIG_MODVERSIONS") == "y" else set())
+    cfi_mode = target_contract.get("cfiMode", "kcfi" if config.get("CONFIG_CFI_CLANG") == "y" or config.get("CONFIG_CFI") == "y" else "none") if target_contract else None
+    direct = legacy_direct_api().inspect(data, cfi_mode)
+    ordinary_imports = imports - set(direct["imports"])
+    needed = ordinary_imports | ({"module_layout"} if config.get("CONFIG_MODVERSIONS") == "y" else set())
+    if target_contract and target_contract.get("ddkExportComparison") is not None:
+        kmi = kmi_api()
+        kmi.ddk_export_comparison(exported,
+            kmi.symvers_exports(kmi.checked(target_contract["inputs"]["buildSymvers"])), needed,
+            selected_only=target_contract.get("abiEvidence", {}).get("method") == "same-kmi-module-loader")
     licenses = {tag[8:] for tag in tags if tag.startswith("license=")}
     gpl = bool(licenses & {"GPL", "GPL v2", "GPL and additional rights", "Dual BSD/GPL", "Dual MIT/GPL", "Dual MPL/GPL"})
     if config.get("CONFIG_MODULE_SIG_PROTECT") == "y" and target_contract is None:
@@ -214,7 +237,6 @@ def inspect_module(data, release, config, symvers, target_contract=None):
         # A signature trailer does not establish a trusted GKI signing key.
         if config.get("CONFIG_MODULE_SIG_PROTECT") == "y" and name in imports and name not in unprotected:
             raise ValueError("ULTRA_BRIDGE_IMPORT_SIG_PROTECT:" + name)
-    cfi_mode = target_contract.get("cfiMode", "kcfi" if config.get("CONFIG_CFI_CLANG") == "y" or config.get("CONFIG_CFI") == "y" else "none") if target_contract else None
     legacy_facts = None
     if cfi_mode == "legacy-lto-cfi":
         legacy_facts = legacy_cfi_api().verify_module(data, target_contract["legacyCfi"])
@@ -229,7 +251,8 @@ def inspect_module(data, release, config, symvers, target_contract=None):
                 offset < 4 or offset > section["sh_size"] - 4 or
                 int.from_bytes(section.data()[offset - 4:offset], "little") != target_contract["initKcfi"]):
             raise ValueError("ULTRA_BRIDGE_INIT_CFI_TARGET")
-    return {"imports": sorted(imports), "vermagic": vermagic[0],
+    return {"imports": sorted(imports), "ordinaryImports": sorted(ordinary_imports),
+            "legacyDirectImports": direct, "vermagic": vermagic[0],
             "providerSymbolsPresent": sorted(required), "cfiMode": cfi_mode,
             "legacyCfi": legacy_facts, "coldBootOrSuQualified": False}
 
@@ -398,6 +421,8 @@ def verify_session_provenance(report, bridge, selection, build, obj, command):
         check_identity(path, proof.get(name, {}), name)
     if session_source_proof(selection, build, bridge.parent) != proof.get("sources"):
         raise ValueError("ULTRA_BRIDGE_SESSION_SOURCE_PROOF")
+    if proof.get("method") == "same-final-module-derived-btf":
+        verify_module_debug_source(proof, bridge, build)
     verify_session_module(bridge.read_bytes(), report)
 
 
@@ -407,6 +432,92 @@ def alloc_sections(data):
                    section["sh_size"], None if section["sh_type"] == "SHT_NOBITS" else digest(section.data()))
                   for section in elf.iter_sections() if section["sh_flags"] & 2 and
                   section.name not in (".BTF", ".BTF.ext"))
+
+
+def module_runtime_facts(data):
+    """Compare strip-debug outputs without treating ELF index renumbering as a change."""
+    elf = ELFFile(io.BytesIO(data))
+    if (elf.elfclass != 64 or not elf.little_endian or
+            elf["e_type"] != "ET_REL" or elf["e_machine"] != "EM_AARCH64"):
+        raise ValueError("ULTRA_BRIDGE_DEBUG_SOURCE_ELF")
+    debug = lambda name: name.startswith((".debug", ".zdebug", ".rel.debug", ".rela.debug",
+                                          ".rel.zdebug", ".rela.zdebug"))
+    sections = list(elf.iter_sections())
+    names = [section.name for section in sections]
+    if len(set(names)) != len(names):
+        raise ValueError("ULTRA_BRIDGE_DEBUG_SOURCE_SECTION_NAMES")
+    table = elf.get_section_by_name(".symtab")
+    if table is None:
+        raise ValueError("ULTRA_BRIDGE_DEBUG_SOURCE_SYMBOLS")
+    symbols = []
+    for symbol in table.iter_symbols():
+        index = symbol["st_shndx"]
+        owner = names[index] if isinstance(index, int) else index
+        symbols.append((symbol.name, symbol["st_info"]["bind"], symbol["st_info"]["type"],
+            tuple(sorted(symbol["st_other"].items())), owner, symbol["st_value"], symbol["st_size"]))
+    retained = Counter(row for row in symbols if row[2] != "STT_FILE" and not debug(row[4]))
+    runtime_sections, relocations = [], []
+    for section in sections:
+        if section["sh_flags"] & 2 or section.name in (".BTF", ".BTF.ext"):
+            runtime_sections.append((section.name, section["sh_type"], section["sh_flags"],
+                section["sh_addr"], section["sh_size"], section["sh_addralign"], section["sh_entsize"],
+                None if section["sh_type"] == "SHT_NOBITS" else digest(section.data())))
+        if section["sh_type"] not in ("SHT_RELA", "SHT_REL") or debug(names[section["sh_info"]]):
+            continue
+        if elf.get_section(section["sh_link"]).name != ".symtab":
+            raise ValueError("ULTRA_BRIDGE_DEBUG_SOURCE_RELOCATION_SYMBOLS")
+        records = Counter((row["r_offset"], row["r_info_type"], symbols[row["r_info_sym"]],
+            row["r_addend"] if row.is_RELA() else None) for row in section.iter_relocations())
+        relocations.append((section.name, names[section["sh_info"]], records))
+    return sorted(runtime_sections), retained, sorted(relocations)
+
+
+def module_debug_source(bridge, build_path):
+    """Use only the successful strict build's retained pre-strip debug carrier."""
+    build = json.loads(build_path.read_text(encoding="utf-8-sig"))
+    if (build.get("exitCode") != 0 or build.get("inputsUnchanged") is not True or
+            build.get("nativeComponentsOnly")):
+        raise ValueError("ULTRA_BRIDGE_DEBUG_SOURCE_STRICT_BUILD_REQUIRED")
+    artifacts = [row for row in build.get("artifacts", []) if row.get("path") ==
+                 "/module/maplesu_ultra_bridge.ko"]
+    if len(artifacts) != 1:
+        raise ValueError("ULTRA_BRIDGE_DEBUG_SOURCE_STRICT_ARTIFACT_REQUIRED")
+    actual = check_identity(bridge, artifacts[0], "debug-final-module")
+    strip = build.get("stripDebug")
+    if strip is None:
+        return bridge
+    check_identity(bridge, strip.get("output", {}), "debug-strip-output")
+    if strip.get("status") == "SIGNED_MODULE_PRESERVED":
+        check_identity(bridge, strip.get("input", {}), "debug-signed-module")
+        return bridge
+    reference = strip.get("unstripped", {})
+    if (strip.get("exitCode") != 0 or any(reference.get(key) != strip.get("input", {}).get(key)
+            for key in ("bytes", "sha256")) or not reference.get("sha256") or
+            strip.get("output", {}).get("sha256") != actual["sha256"]):
+        raise ValueError("ULTRA_BRIDGE_DEBUG_SOURCE_STRIP_RECEIPT")
+    raw = reference.get("path", "").replace("\\", "/")
+    if ".." in raw.split("/") or Path(raw).name != "maplesu_ultra_bridge.unstripped.ko":
+        raise ValueError("ULTRA_BRIDGE_DEBUG_SOURCE_RETAINED_PATH")
+    # A formal510 receipt may be copied from build-evidence/ to canonical
+    # kernel/ unchanged. Resolve only that cohort-local sibling, not a search.
+    candidates = [Path(raw), build_path.parent / Path(raw).name,
+                  build_path.parent.parent / Path(raw).parent.name / Path(raw).name]
+    source = next((path for path in candidates if path.is_file()), None)
+    if source is None:
+        raise ValueError("ULTRA_BRIDGE_DEBUG_SOURCE_MISSING")
+    check_identity(source, reference, "unstripped-module")
+    if module_runtime_facts(source.read_bytes()) != module_runtime_facts(bridge.read_bytes()):
+        raise ValueError("ULTRA_BRIDGE_DEBUG_SOURCE_RUNTIME_CHANGED")
+    return source.resolve()
+
+
+def verify_module_debug_source(provenance, bridge, build_path):
+    source = module_debug_source(bridge, build_path)
+    reference = provenance.get("moduleDebugSource")
+    if reference is not None:
+        check_identity(source, reference, "module-debug-source")
+    elif source != bridge:
+        raise ValueError("ULTRA_BRIDGE_DEBUG_SOURCE_PROVENANCE_REQUIRED")
 
 
 def session_abi_main():
@@ -432,7 +543,10 @@ def session_abi_main():
         raise ValueError("ULTRA_BRIDGE_SESSION_ACTUAL_TU_COMMAND")
     raw_object = obj.read_bytes()
     native_object = raw_object.startswith(b"\x7fELF")
-    source = obj if native_object else bridge
+    source = obj if native_object else module_debug_source(bridge, paths["strictBuild"])
+    if not native_object:
+        paths["moduleDebugSource"] = source
+        before["moduleDebugSource"] = file_identity(source)
     method = "same-tu-object-derived-btf" if native_object else "same-final-module-derived-btf"
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
@@ -500,6 +614,11 @@ def publish_bundle(output, paths, data, release, module, source_data):
              "target_identity": (None, "target-identity.source.json")}
     if "btf" in data:
         files["btf"] = ("btf", "target.btf")
+    if "abiEvidence" in module:
+        data["abi_evidence"] = (json.dumps(module["abiEvidence"], indent=2) + "\n").encode("utf-8")
+        if not 0 < len(data["abi_evidence"]) <= 1024 * 1024:
+            raise ValueError("ULTRA_BRIDGE_ABI_EVIDENCE_SIZE_LIMIT")
+        files["abi_evidence"] = ("abiEvidence", "abi-evidence.json")
     if "session_abi" in data:
         files["session_abi"] = ("sessionAbi", "session-abi.json")
     if "task_profile_abi" in data:
@@ -685,6 +804,157 @@ def bind_runtime_layouts(module, btf_bytes, config, kernel):
                      "derivedModuleSha256": digest(derived), "runtimeOrDeviceAccepted": False}
 
 
+def catalog_api():
+    spec = importlib.util.spec_from_file_location("bridge_package_catalog", Path(__file__).with_name("package_catalog.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def component_kmi(release, selection=None, build=None):
+    # DDK vermagic often has no Android tag. Its actual build cohort supplies
+    # the asset classification, as in KernelSU's DDK build and KMI asset naming.
+    candidates = []
+    command = (build or {}).get("command", [])
+    for index, argument in enumerate(command):
+        if argument.startswith("O="):
+            candidates.append(argument[2:])
+        elif argument == "-C" and index + 1 < len(command):
+            candidates.append(command[index + 1])
+    for row in (selection or {}).get("selectedNativePrivateHeaders", []):
+        candidates.append(row.get("kernelBuild", ""))
+    for candidate in candidates:
+        name = str(candidate).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+        if re.fullmatch(r"android[0-9]+-(?:5\.(?:10|15)|6\.(?:1|6|12|18))", name):
+            return name
+    if isinstance(release, str):
+        series = re.match(r"^(5\.(?:10|15)|6\.(?:1|6|12|18))(?:\.|-)", release)
+        android = re.search(r"(?:^|-)android([0-9]+)(?:-|$)", release)
+        if series is not None and android is not None:
+            return "android" + android[1] + "-" + series[1]
+    return None
+
+
+def inspect_component_module(data, release, config, cfi_mode):
+    """Verify a build's inputs without claiming facts about a consumer kernel."""
+    if cfi_mode not in ("none", "kcfi", "legacy-lto-cfi"):
+        raise ValueError("ULTRA_COMPONENT_CFI_MODE")
+    elf = ELFFile(io.BytesIO(data))
+    if (elf.elfclass != 64 or not elf.little_endian or
+            elf["e_type"] != "ET_REL" or elf["e_machine"] != "EM_AARCH64"):
+        raise ValueError("ULTRA_COMPONENT_MODULE_ELF")
+    table, info = elf.get_section_by_name(".symtab"), elf.get_section_by_name(".modinfo")
+    if table is None or info is None:
+        raise ValueError("ULTRA_COMPONENT_MODULE_METADATA")
+    tags = [x.decode("ascii") for x in info.data().split(b"\0") if x]
+    if tags.count("maplesu_runtime_facts=1") != 1:
+        raise ValueError("ULTRA_COMPONENT_RUNTIME_FACTS_REQUIRED")
+    for name in ("credential", "deployment_namespace"):
+        if tags.count("parmtype=" + name + ":string") != 1:
+            raise ValueError("ULTRA_COMPONENT_PARAMETER:" + name)
+    magic = [x[9:] for x in tags if x.startswith("vermagic=")]
+    if len(magic) != 1 or magic[0].split(" ", 1)[0] != release:
+        raise ValueError("ULTRA_COMPONENT_BUILD_RELEASE")
+    symbols = {s.name for s in table.iter_symbols()}
+    actual_cfi = ("kcfi" if any(name.startswith("__kcfi_typeid_") for name in symbols) or
+                  elf.get_section_by_name(".kcfi_traps") is not None else
+                  "legacy-lto-cfi" if "__cfi_check" in symbols else "none")
+    defined = {s.name for s in table.iter_symbols() if s["st_shndx"] != "SHN_UNDEF"}
+    required = {"init_module", "msu_boot_sdk_init", "msu_manager_resident_init",
+                "msu_management_init", "msu_runtime_service_register", "msu_su_registry_create",
+                "msu_runtime_btf_init", "msu_runtime_accessor_init", "msu_task_profile_runtime_produce"}
+    if required - defined:
+        raise ValueError("ULTRA_COMPONENT_RUNTIME_PRODUCERS:" + ",".join(sorted(required - defined)))
+    direct = legacy_direct_api().inspect(data, actual_cfi)
+    metadata = module_parameter_metadata(data, config)
+    return dict(metadata, cfiMode=actual_cfi, requestedCfiMode=cfi_mode, buildVermagic=magic[0],
+                legacyDirectImports=direct, runtimeFactsAbi="maplesu-runtime-facts/1",
+                targetQualified=False, deviceQualified=False)
+
+
+def component_main():
+    parser = argparse.ArgumentParser(description="Package a strict-built, boot-adapting KMI component")
+    for name in ("kernel-build", "bridge", "handoff", "handoff-verifier",
+                 "source-selection", "strict-build", "output"):
+        parser.add_argument("--" + name, type=Path, required=True)
+    parser.add_argument("--kmi", required=True)
+    parser.add_argument("--cfi-mode", required=True, choices=("none", "kcfi", "legacy-lto-cfi"))
+    parser.add_argument("--ksu-init", type=Path)
+    add_python_dependency_options(parser)
+    args = parser.parse_args(sys.argv[2:])
+    python_dependency(args)
+    catalog = catalog_api()
+    catalog.require(re.fullmatch(r"android[0-9]+-(?:5\.(?:10|15)|6\.(?:1|6|12|18))", args.kmi),
+                    "ULTRA_COMPONENT_KMI")
+    paths = {name: getattr(args, name).resolve() for name in
+             ("bridge", "handoff", "handoff_verifier", "source_selection", "strict_build")}
+    paths.update(config=args.kernel_build.resolve() / ".config",
+                 release=args.kernel_build.resolve() / "include/generated/utsrelease.h")
+    if args.ksu_init:
+        paths["ksu_init"] = args.ksu_init.resolve()
+    data = {name: path.read_bytes() for name, path in paths.items()}
+    selection = json.loads(data["source_selection"])
+    catalog.require(selection.get("runtimeFactsSelected") is True and
+                    selection.get("targetBinding", {}).get("kind") == "runtime-kmi-component",
+                    "ULTRA_COMPONENT_RUNTIME_SOURCE_SELECTION")
+    sources, dependencies = catalog.selection_sources(selection)
+    catalog.check_strict_build(paths["source_selection"], paths["strict_build"],
+                               {"bytes": len(data["bridge"]), "sha256": digest(data["bridge"])})
+    build = json.loads(data["strict_build"])
+    for name in ("config", "release"):
+        expected = {"bytes": len(data[name]), "sha256": digest(data[name])}
+        catalog.require(any(all(row.get(k) == expected[k] for k in expected)
+                            for row in build.get("sources", [])), "ULTRA_COMPONENT_BUILD_INPUT:" + name)
+    releases = re.findall(r'^#define UTS_RELEASE "([^"\r\n]+)"$', data["release"].decode(), re.M)
+    catalog.require(len(releases) == 1, "ULTRA_COMPONENT_BUILD_RELEASE")
+    release = releases[0]
+    build_kmi = component_kmi(release, selection, build)
+    module = inspect_component_module(data["bridge"], release, config_values(data["config"]), args.cfi_mode)
+    verifier_spec = importlib.util.spec_from_file_location("component_handoff_verifier", paths["handoff_verifier"])
+    verifier = importlib.util.module_from_spec(verifier_spec)
+    verifier_spec.loader.exec_module(verifier)
+    verifier.verify_static_executable(data["handoff"])
+    if "ksu_init" in data:
+        verifier.verify_static_executable(data["ksu_init"])
+    generation = digest(catalog.encoded({"moduleSources": sources, "handoffSha256": digest(data["handoff"])}))
+    manifest = dict(schemaVersion=2, kind="kmi-component", kmi=build_kmi or args.kmi, architecture="arm64",
+                    pageSize=module["pageBytes"], cfiMode=module["cfiMode"], kernelRelease=release,
+                    credentialMode="module-parameter", metadataDisplacement=module["metadataDisplacement"],
+                    runtimeFactsAbi="maplesu-runtime-facts/1", sourceGenerationSha256=generation)
+    files = {"bridge": "bridge.ko", "handoff": "ultra-init"}
+    if "ksu_init" in data:
+        files["ksu_init"] = "ksuinit"
+    source_proof = dict(schemaVersion=2, kind="kmi-component", sourceGenerationSha256=generation,
+        buildClassification=dict(kmi=build_kmi, requestedKmi=args.kmi, requestedCfiMode=args.cfi_mode,
+                                 cfiMode=module["cfiMode"], buildCommand=build.get("command")),
+        generationInputs={"moduleSources": sources, "handoffSha256": digest(data["handoff"])},
+        sourceSelection=file_identity(paths["source_selection"]), strictBuild=file_identity(paths["strict_build"]),
+        inputs={name: dict(file_identity(path), bundledAs=files.get(name),
+                          bundledBytes=len(data[name]), bundledSha256=digest(data[name])) for name, path in paths.items()})
+    data["bundleSources"] = catalog.encoded(source_proof)
+    files["bundleSources"] = "BUNDLE-SOURCES.json"
+    output = args.output.resolve()
+    catalog.require(not output.exists(), "ULTRA_COMPONENT_OUTPUT_NOT_FRESH")
+    for path, expected in dependencies:
+        catalog.same(catalog.identity(path), expected, "ULTRA_COMPONENT_SELECTED_SOURCE_CHANGED")
+    for name, path in paths.items():
+        catalog.require(path.read_bytes() == data[name], "ULTRA_COMPONENT_INPUT_CHANGED:" + name)
+    output.mkdir(parents=True)
+    for name, filename in files.items():
+        field = "ksuInit" if name == "ksu_init" else name
+        (output / filename).write_bytes(data[name])
+        catalog.require((output / filename).read_bytes() == data[name], "ULTRA_COMPONENT_COPY_CHANGED:" + name)
+        manifest[field] = filename
+        manifest[field + "Sha256"] = digest(data[name])
+    (output / "MODULE-INPUT-CHECK.json").write_bytes(catalog.encoded(module))
+    # Publish the entry point only after all selected source and output identities agree.
+    pending = output / "manifest.json.tmp"
+    pending.write_bytes(catalog.encoded(manifest))
+    catalog.require(pending.read_bytes() == catalog.encoded(manifest), "ULTRA_COMPONENT_MANIFEST_COPY")
+    pending.rename(output / "manifest.json")
+    print(json.dumps(manifest, sort_keys=True))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("target-boot", "kernel-image", "kernel-build", "target-config",
@@ -732,7 +1002,11 @@ def main():
                                 ("symvers", contract["targetSymvers"])):
             if digest(data[name]) != reference["sha256"] or len(data[name]) != reference["bytes"]:
                 raise ValueError("ULTRA_BRIDGE_KMI_PACKAGE_INPUT:" + name)
-        if "btf" not in data or digest(data["btf"]) != contract["inputs"]["targetBtf"]["sha256"]:
+        target_btf = contract["inputs"].get("targetBtf")
+        if target_btf is None:
+            if "btf" in data or contract.get("abiEvidence", {}).get("method") != "same-kmi-module-loader":
+                raise ValueError("ULTRA_BRIDGE_KMI_PACKAGE_INPUT:btf")
+        elif ("btf" not in data or digest(data["btf"]) != target_btf["sha256"] or len(data["btf"]) != target_btf["bytes"]):
             raise ValueError("ULTRA_BRIDGE_KMI_PACKAGE_INPUT:btf")
     else:
         if (kdir / ".config").read_bytes() != data["target_config"]:
@@ -781,8 +1055,17 @@ def main():
         task_profile = json.loads(data["task_profile_abi"])
         task_api.verify_provenance(task_profile, paths["bridge"], paths["bridge"].parent / "SOURCE-SELECTION.json",
                                   paths["bridge"].parent.parent / "kernel/BUILD.json", paths["target_config"])
-    data["bridge"], runtime_binding = bind_runtime_layouts(data["bridge"], data.get("btf"), config, data["kernel_image"])
-    module = inspect_module(data["bridge"], release, config, data["symvers"], kmi_contract)
+    if kmi_contract and kmi_contract.get("abiEvidence", {}).get("method") == "same-kmi-module-loader":
+        # Establish every ordinary import/CRC, module_layout, namespace, GPL,
+        # vermagic and CFI requirement before making the compiled tables ready.
+        module = inspect_module(data["bridge"], release, config, data["symvers"], kmi_contract)
+        sys.path.insert(0, str(kmi_api().ROOT / "tools/specgen"))
+        from specgen.kallsyms import decode
+        data["bridge"], runtime_binding, module["abiEvidence"] = compiled_native_layouts_api().bind(
+            data["bridge"], config, data["kernel_image"], kmi_contract, module, decode(data["kernel_image"]))
+    else:
+        data["bridge"], runtime_binding = bind_runtime_layouts(data["bridge"], data.get("btf"), config, data["kernel_image"])
+        module = inspect_module(data["bridge"], release, config, data["symvers"], kmi_contract)
     if dependency is not None:
         module["pythonDependency"] = dependency
     module["runtimeLayoutBinding"] = runtime_binding
@@ -840,5 +1123,7 @@ def main():
 if __name__ == "__main__":
     if sys.argv[1:2] == ["session-abi"]:
         session_abi_main()
+    elif sys.argv[1:2] == ["component"]:
+        component_main()
     else:
         main()

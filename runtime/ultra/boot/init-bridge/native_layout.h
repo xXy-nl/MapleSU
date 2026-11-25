@@ -10,6 +10,9 @@
  * On failure, output is unchanged. Full environment support is mandatory. */
 int msu_init_bridge_native_layout(unsigned int allocator_flags,
     unsigned int execmem_free, struct msu_boot_sdk_layout *output);
+struct msu_runtime_btf_field;
+int msu_init_bridge_native_layout_init(int (*query)(const char *, const char *,
+    struct msu_runtime_btf_field *));
 
 #define MSU_INIT_BRIDGE_RUNTIME_MAGIC 0x4d534942U
 #define MSU_INIT_BRIDGE_RUNTIME_SCHEMA 1U

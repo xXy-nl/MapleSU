@@ -320,7 +320,7 @@ class StageChecks(unittest.TestCase):
         self.assertIn("request_protocol.h", selected)
         self.assertNotIn("-DMSU_MANAGEMENT_PROFILE_DOMAIN_VERIFIED=1", kbuild)
         self.assertNotIn("-DMSU_SU_NAMESPACE_NATIVE_VERIFIED=1", kbuild)
-        self.assertIn("-DMSU_MANAGEMENT_PUBLICATION_GATE_VERIFIED=0", kbuild)
+        self.assertNotIn("MSU_MANAGEMENT_PUBLICATION_GATE_VERIFIED", kbuild)
         self.assertFalse(any("su_native_reader_abi.h" in name for name in selected))
         self.assertEqual(receipt["credentialMode"], "module-parameter")
 
@@ -506,7 +506,7 @@ class StageChecks(unittest.TestCase):
         self.assertEqual(len(receipt["formalSuSelections"]), 1)
         self.assertFalse(receipt["factoryInstalled"])
         self.assertFalse(receipt["targetQualified"])
-        self.assertIn(b"#define MSU_BS_ENVIRONMENT 0", self.files[self.output / "boot_sdk_layout.h"])
+        self.assertIn(b"#define MSU_BS_ENVIRONMENT 1", self.files[self.output / "boot_sdk_layout.h"])
 
     def test_runtime_missing_or_changed_frozen_input_has_no_receipt(self):
         self.runtime_selections()

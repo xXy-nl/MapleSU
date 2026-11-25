@@ -21,6 +21,8 @@ EARLY_RUNTIME_UNITS = ("manager_early_fixed", "manager_early_oem", "manager_earl
 TARGET_PROFILE_SOURCES = ("fs/exec.c", "fs/stat.c", "fs/open.c",
                           "arch/arm64/include/asm/syscall_wrapper.h",
                           "arch/arm64/include/asm/ptrace.h", "include/linux/binfmts.h")
+RUNTIME_FACT_UNITS = ("manager_runtime_btf", "manager_runtime_accessor", "manager_task_profile_runtime")
+RUNTIME_FACT_HEADERS = ("manager_task_profile_workbit.h",)
 
 
 def identity(path, data=None):
@@ -73,6 +75,8 @@ def main():
     parser.add_argument("--su-selection", type=Path, action="append", default=[])
     parser.add_argument("--runtime-layout-source-selection", type=Path)
     parser.add_argument("--runtime-layout-source-selection-sha256")
+    parser.add_argument("--runtime-facts", action="store_true",
+                        help="Select boot-time fact producers for an independent KMI component")
     parser.add_argument("--seccomp-source-selection", type=Path)
     parser.add_argument("--seccomp-source-selection-sha256")
     args = parser.parse_args()
@@ -626,7 +630,10 @@ def main():
             "su_profile_namespace.c", "su_profile_namespace.h"
         )} | {session_receipt} | {
             "runtime/ultra/boot/init-bridge/" + name for name in
-            ("native_lookup.c", "native_lookup.h", "native_cfi.h", "native_imports.c", "native_imports.h")
+            ("native_lookup.c", "native_lookup.h", "native_cfi.h", "native_imports.c", "native_imports.h",
+             "native_direct.h", "native_sdk_imports.c", "native_sdk.h", "Kbuild",
+             "boot_events.c", "boot_events.h", "preinit.h", "bridge.c",
+             "native_layout.c", "native_layout.h")
         }
         seen = set()
         for row in selected_layout["files"]:
@@ -639,7 +646,13 @@ def main():
             previous = bindings.get(relative)
             if before is None:
                 if relative not in {"runtime/ultra/identity/kernel/manager_dynamic_layout.c",
-                                    "runtime/ultra/identity/kernel/manager_dynamic_layout.h"} or previous:
+                                    "runtime/ultra/identity/kernel/manager_dynamic_layout.h",
+                                    "runtime/ultra/identity/kernel/manager_ksu_compat.c",
+                                    "runtime/ultra/identity/kernel/manager_ksu_compat.h",
+                                    *("runtime/ultra/identity/kernel/" + unit + suffix
+                                      for unit in RUNTIME_FACT_UNITS for suffix in (".c", ".h")),
+                                    *("runtime/ultra/identity/kernel/" + name for name in RUNTIME_FACT_HEADERS),
+                                    "runtime/ultra/boot/init-bridge/native_direct.h"} or previous:
                     raise ValueError("ULTRA_BRIDGE_RUNTIME_LAYOUT_ADDITION:" + relative)
             else:
                 checked_reference(before)
@@ -653,6 +666,14 @@ def main():
             raise ValueError("ULTRA_BRIDGE_RUNTIME_LAYOUT_SOURCE_CLOSURE")
         runtime_successors.append(runtime_layout_identity)
         with_runtime_layout = True
+    if args.runtime_facts:
+        required_facts = {"runtime/ultra/identity/kernel/" + unit + suffix
+                          for unit in RUNTIME_FACT_UNITS for suffix in (".c", ".h")}
+        required_facts.update("runtime/ultra/identity/kernel/" + name for name in RUNTIME_FACT_HEADERS)
+        if not runtime_selection or not with_runtime_layout or not required_facts.issubset(bindings):
+            raise ValueError("ULTRA_BRIDGE_RUNTIME_FACTS_SOURCE_CLOSURE")
+        if args.target_kmi:
+            raise ValueError("ULTRA_BRIDGE_RUNTIME_FACTS_EXACT_TARGET_CONFLICT")
 
     def select(relative, destination, overlays, included_by=None):
         binding = bindings.get(relative)
@@ -691,7 +712,9 @@ def main():
         relative = path.relative_to(args.repo_root).as_posix()
         select(relative, "preinit/nolibc/" + path.relative_to(args.repo_root / "third_party/kernelsu/upstream/kernel/preinit/runner/nolibc").as_posix(), [args.repo_root])
     host = "runtime/ultra/identity/kernel/"
-    core_units = ("manager_task_state", "manager_credential_domain") + (("manager_dynamic_layout",) if with_runtime_layout else ())
+    core_units = (("manager_task_state", "manager_credential_domain") +
+                  (("manager_dynamic_layout",) if with_runtime_layout else ()) +
+                  (RUNTIME_FACT_UNITS if args.runtime_facts else ()))
     units = ("install_records", "protected_install_kernel", "manager_apk_identity", "manager_claim_entry",
              "manager_owner", "manager_owner_watch", "manager_resident_host", "manager_management",
              "manager_uid_gateway", "manager_uid_snapshot") + core_units
@@ -711,6 +734,10 @@ def main():
         # Freestanding HOST emission includes this source; a normal LKM uses
         # native exported byte helpers, so no second memcpy/memset is linked.
         select(host + "manager_bytes.c", "host/manager_bytes.c", roots)
+    producer = "jailbreak-providers/root-loader/"
+    for name in ("module/maplesu_boot_sdk.c", "module/boot_sdk_call.S", "module/boot_sdk_protocol.h",
+                 "module/boot_sdk_allocator.h", "boot_sdk_abi.h"):
+        select(producer + name, "producer/" + name, [candidate, args.repo_root])
     target_profile = host + "manager_su_runtime_target_profile.h" in bindings
     kmi_contract = None
     if args.target_kmi:
@@ -722,9 +749,14 @@ def main():
         if args.require_resident_text_owner_kmi:
             kmi_contract = kmi.read_contract(args.target_kmi, args.kernel_build,
                 require_resident_text_owner=True,
-                selected_imports={name: content.get(name) for name in ("native_imports.c", "native_imports.h")})
+                selected_imports={name: content.get(name) for name in ("native_imports.c", "native_imports.h",
+                    "native_direct.h", "native_sdk_imports.c", "native_sdk.h", "Kbuild",
+                    "producer/module/maplesu_boot_sdk.c")})
         else:
-            kmi_contract = kmi.read_contract(args.target_kmi, args.kernel_build)
+            kmi_contract = kmi.read_contract(args.target_kmi, args.kernel_build,
+                selected_imports={name: content.get(name) for name in ("native_imports.c", "native_imports.h",
+                    "native_direct.h", "native_sdk_imports.c", "native_sdk.h", "Kbuild",
+                    "producer/module/maplesu_boot_sdk.c")})
         capture_bytes(args.target_kmi)
         for reference in [*kmi_contract["inputs"].values(), kmi_contract["profile"], kmi_contract["targetSymvers"]]:
             capture_bytes(kmi.reference_path(reference))
@@ -757,6 +789,15 @@ def main():
         select(session_receipt, "sdk/src/payload/su/su_session_receipt.h", [args.su_overlay, args.repo_root])
     elif re.search(rb"\bmsu_su_exec_session_\w+\s*\(", content.get("host/manager_su_runtime_factory.c", b"")):
         raise ValueError("ULTRA_BRIDGE_SU_SESSION_SELECTION_REQUIRED")
+    ksu_members = (host + "manager_ksu_compat.c", host + "manager_ksu_compat.h")
+    with_ksu_compat = any(relative in bindings for relative in ksu_members)
+    if with_ksu_compat:
+        if not all(relative in bindings for relative in ksu_members):
+            raise ValueError("ULTRA_BRIDGE_KSU_COMPAT_SOURCE_SET")
+        for relative in ksu_members:
+            select(relative, "host/" + Path(relative).name, roots)
+    elif re.search(rb"\bmsu_ksu_compat_\w+\s*\(", content.get("host/manager_su_runtime_factory.c", b"")):
+        raise ValueError("ULTRA_BRIDGE_KSU_COMPAT_SELECTION_REQUIRED")
     # An explicit six-file cohort belongs to this same real bridge LKM.
     # Never fill an incomplete formal cohort from a mutable overlay.
     with_nonroot = any(relative in bindings for relative in nonroot_members)
@@ -771,10 +812,6 @@ def main():
     elif any(re.search(rb"\bmsu_su_(?:nonroot_|runtime_nonroot_)\w+\s*\(",
                        content.get("host/" + unit + ".c", b"")) for unit in HOST_RUNTIME_UNITS):
         raise ValueError("ULTRA_BRIDGE_SU_NONROOT_SELECTION_REQUIRED")
-    producer = "jailbreak-providers/root-loader/"
-    for name in ("module/maplesu_boot_sdk.c", "module/boot_sdk_call.S", "module/boot_sdk_protocol.h",
-                 "module/boot_sdk_allocator.h", "boot_sdk_abi.h"):
-        select(producer + name, "producer/" + name, [candidate, args.repo_root])
     # Follow only the reviewed private include closure from actually selected
     # sources, retaining each selected file's identity. Conditional includes are
     # available to the compiler without enabling their native target provider.
@@ -841,6 +878,13 @@ def main():
             target_binding["runtimeLayoutProfile"] = runtime_layout_identity
         if args.require_resident_text_owner_kmi:
             target_binding["residentTextOwner"] = kmi_contract["residentTextOwner"]
+    elif args.runtime_facts:
+        if not target_profile:
+            raise ValueError("ULTRA_BRIDGE_RUNTIME_FACTS_PROFILE_REQUIRED")
+        target_binding = {"kind": "runtime-kmi-component", "buildConfig": native_config,
+                          "pageBytes": pages[0], "runtimeLayoutProfile": runtime_layout_identity,
+                          "profile": bindings[host + "manager_su_runtime_target_profile.h"][0],
+                          "kernelImageIdentityEstablished": False, "targetQualified": False}
     elif target_profile:
         if not initialization_child:
             raise ValueError("ULTRA_BRIDGE_TARGET_PROFILE_SOURCE_CONTRACT_REQUIRED")
@@ -886,7 +930,8 @@ def main():
     execmem = capture(execmem_header) if execmem_present else ""
     execmem = re.sub(r"/\*.*?\*/|//[^\n]*", "", execmem, flags=re.S)
     feature = {"MSU_RESOLVER_FS_HAS_LOCK": int(lock), "MSU_RESOLVER_FS_SEQLOCK": int(sequence[0] == "seqlock_t"),
-               "MSU_MANAGEMENT_EXECMEM_ALLOC_RW": int(bool(re.search(r"\bexecmem_alloc_rw\s*\(", execmem)))}
+               "MSU_MANAGEMENT_EXECMEM_ALLOC_RW": int(bool(re.search(r"\bexecmem_alloc_rw\s*\(", execmem))),
+               "MSU_MANAGEMENT_TASK_STATE_VERIFIED": int("manager_task_state" in core_units)}
     seccomp_api = None
     if bool(args.seccomp_source_selection) != bool(args.seccomp_source_selection_sha256):
         raise ValueError("ULTRA_BRIDGE_SECCOMP_SOURCE_SELECTION_PAIR")
@@ -952,7 +997,8 @@ def main():
         feature["MSU_MANAGEMENT_CRED_UCOUNTS"] = int(bool(fields))
     content["host/msu_resolver_build_config.h"] = ("#ifndef MSU_INIT_BRIDGE_FEATURE_CONFIG\n#define MSU_INIT_BRIDGE_FEATURE_CONFIG\n" +
         "".join("#define %s %d\n" % row for row in feature.items()) + "#endif\n").encode()
-    content["boot_sdk_layout.h"] = ("#define MSU_BS_STATIC_BOOTSTRAP 0\n#define MSU_BS_ENVIRONMENT 0\n"
+    content["boot_sdk_layout.h"] = ("#define MSU_BS_STATIC_BOOTSTRAP 0\n#define MSU_BS_ENVIRONMENT 1\n"
+        "#define MSU_BS_EXECVE_REG 1\n#define MSU_BS_EXECVE_CHAR 0\n"
         "#define MSU_BS_ALLOCATOR_NOPROF 0\n#define MSU_BS_PAGE_BYTES %d\n" % pages[0]).encode()
     core_objects = ["host/" + unit + ".o" for unit in core_units]
     if with_session:
@@ -964,6 +1010,11 @@ def main():
     if with_session:
         content["selected-core.mk"] += ("ccflags-y += -DMSU_SU_EXEC_SESSION_NATIVE=1\nCFLAGS_" + session_object +
             " += -DMSU_INIT_BRIDGE_HOST_IMPORTS=1 -include $(src)/native_imports.h\n").encode()
+    if args.runtime_facts:
+        content["selected-core.mk"] += b"ccflags-y += -DMSU_INIT_BRIDGE_RUNTIME_FACTS=1\n"
+        for unit in RUNTIME_FACT_UNITS + ("manager_su_runtime_target",):
+            content["selected-core.mk"] += ("CFLAGS_host/" + unit +
+                ".o += -DMSU_INIT_BRIDGE_HOST_IMPORTS=1 -include $(src)/native_imports.h\n").encode()
     if with_nonroot:
         content["selected-core.mk"] += b"ccflags-y += -DMSU_SU_NONROOT_NATIVE=1\n"
         for obj in nonroot_objects:
@@ -971,6 +1022,12 @@ def main():
                 " += -DMSU_INIT_BRIDGE_HOST_IMPORTS=1 -include $(src)/native_imports.h\n").encode()
         content["selected-core.mk"] += (
             "CFLAGS_host/su_nonroot_mount_source.o += -I$(src)/native-private\n").encode()
+    if kmi_contract and kmi_contract.get("abiEvidence", {}).get("method") == "same-kmi-module-loader":
+        selected_features = {name: int(bool(feature.get(name, 0))) for name in
+                             ("MSU_MANAGEMENT_RESIDENT_TEXT_OWNER", "MSU_MANAGEMENT_CRED_UCOUNTS")}
+        selected_features.update(MSU_SU_EXEC_SESSION_NATIVE=int(with_session), MSU_SU_NONROOT_NATIVE=int(with_nonroot))
+        if selected_features != kmi_contract.get("nativeImportsFeatures"):
+            raise ValueError("ULTRA_BRIDGE_KMI_NATIVE_SELECTED_FEATURES")
     # CORE73's real resident calls installation_init with its own host/name.
     # Bind the existing HOST constructor at that typed call, without editing or
     # copying either owner implementation. Cleanup follows HOST's same order.
@@ -1073,6 +1130,8 @@ int msu_init_bridge_installation_init(const maplesu_host_instance *host, const u
                 raise ValueError("ULTRA_BRIDGE_EARLY_RUNTIME_FACTORY_CALLSITE")
             content["native_factory_bind.c"] = content["native_factory_bind.c"].replace(anchor, replacement)
     runtime_objects = ["host/" + unit + ".o" for unit in HOST_RUNTIME_UNITS] if runtime_selection else []
+    if with_ksu_compat:
+        runtime_objects.append("host/manager_ksu_compat.o")
     if with_early_runtime:
         runtime_objects.extend("host/" + unit + ".o" for unit in EARLY_RUNTIME_UNITS)
     content["selected-runtime.mk"] = ("# Exact frozen HOST constructor/provider/installation objects.\n" +
@@ -1080,6 +1139,8 @@ int msu_init_bridge_installation_init(const maplesu_host_instance *host, const u
          "host_tus += manager_installation_state manager_su_runtime_factory "
          "su_observed_install_source su_durable_authority su_durable_modern\n"
          if runtime_objects else "")).encode()
+    if with_ksu_compat:
+        content["selected-runtime.mk"] += b"host_tus += manager_ksu_compat\n"
     if factory_binding:
         content["selected-runtime.mk"] += ("maplesu_ultra_bridge-y += native_factory_bind.o\n"
             "CFLAGS_host/manager_resident_host.o += -DMSU_INIT_BRIDGE_RESIDENT_FACTORY=1 "
@@ -1119,7 +1180,8 @@ int msu_init_bridge_installation_init(const maplesu_host_instance *host, const u
                    ("native_factory_bind.c", "native_factory_bind.h") if factory_binding],
                "selectedHostRuntimeObjects": runtime_objects,
                "credentialMode": "module-parameter", "pageBytes": pages[0],
-               "selectedCoreDependencyObjects": core_objects, "runtimeLayoutSelected": with_runtime_layout, "wholeCoreSnapshotSelected": False,
+               "selectedCoreDependencyObjects": core_objects, "runtimeLayoutSelected": with_runtime_layout,
+               "runtimeFactsSelected": args.runtime_facts, "wholeCoreSnapshotSelected": False,
                "selectedCorePrivateIncludes": [row for row in rows if "includedBy" in row],
                "selectedSuComponentObjects": ["host/" + unit + ".o" for unit in su_units],
                "compiled": False, "tested": False, "targetQualified": False,

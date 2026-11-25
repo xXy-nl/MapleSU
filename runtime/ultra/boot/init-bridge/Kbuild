@@ -11,8 +11,9 @@ maplesu_ultra_bridge-y := bridge.o boot_events.o preinit.o preinit_blob.o native
     host/su_profile_namespace.o host/su_profile_execution.o host/su_profile_resolve.o
 
 ccflags-y += -I$(src) -I$(src)/host -I$(src)/producer -I$(src)/producer/module
+ccflags-y += -include $(src)/native_direct.h
 # Do not disable target CFI, LTO, SCS, stack protection, module CRCs or namespaces.
-ccflags-y += -DMSU_BOOT_SDK_NATIVE=1 -DMSU_MANAGEMENT_PUBLICATION_GATE_VERIFIED=0
+ccflags-y += -DMSU_BOOT_SDK_NATIVE=1
 asflags-y += -I$(src) -DMSU_BOOT_SDK_NATIVE=1
 # Assembly shares the C sanitizer mode without inheriting C-only options.
 msu_bridge_cc_has_kcfi := $(shell output="$$($(CC) $(NOSTDINC_FLAGS) $(LINUXINCLUDE) \

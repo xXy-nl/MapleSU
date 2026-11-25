@@ -4,12 +4,27 @@ from contextlib import ExitStack
 import json
 from pathlib import Path
 import sys
+import struct
 import unittest
 from unittest.mock import Mock, patch
 
 spec = importlib.util.spec_from_file_location("bridge_package", Path(__file__).parents[1] / "package.py")
 package = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(package)
+
+
+def module_without_direct_calls():
+    # The independent direct-call parser consumes these real ELF bytes while
+    # the existing structural tests supply their own symbol/config facts.
+    strings = b"\0.shstrtab\0"
+    sections = (64 + len(strings) + 7) & ~7
+    header = struct.pack("<16sHHIQQQIHHHHHH", b"\x7fELF\x02\x01\x01" + bytes(9),
+        1, 183, 1, 0, 0, sections, 0, 64, 0, 0, 64, 2, 1)
+    names = struct.pack("<IIQQQQIIQQ", 1, 3, 0, 0, 64, len(strings), 0, 0, 1, 0)
+    return header + strings + bytes(sections - 64 - len(strings)) + bytes(64) + names
+
+
+NO_DIRECT_MODULE = module_without_direct_calls()
 
 
 class Section:
@@ -52,7 +67,7 @@ class PackagingChecks(unittest.TestCase):
         self.config = {"CONFIG_ARM64": "y", "CONFIG_MODULES": "y", "CONFIG_MODVERSIONS": "y"}
         self.symvers = b"0x00000001\tregister_kprobe\tvmlinux\tEXPORT_SYMBOL_GPL\tTEST\n0x00000002\tmodule_layout\tvmlinux\tEXPORT_SYMBOL\n"
 
-    def inspect(self, data=b"fixture"):
+    def inspect(self, data=NO_DIRECT_MODULE):
         with patch.object(package, "ELFFile", return_value=self.elf):
             return package.inspect_module(data, "6.18.21-4k", self.config, self.symvers)
 
@@ -108,7 +123,7 @@ class PackagingChecks(unittest.TestCase):
         self.config["CONFIG_MODULE_SIG_FORCE"] = "y"
         with self.assertRaisesRegex(ValueError, "TARGET_MODULE_SIGNATURE_REQUIRED"):
             self.inspect()
-        self.assertFalse(self.inspect(b"fixture~Module signature appended~\n")["coldBootOrSuQualified"])
+        self.assertFalse(self.inspect(NO_DIRECT_MODULE + b"~Module signature appended~\n")["coldBootOrSuQualified"])
 
     def test_duplicate_symvers_or_module_versions_are_not_silently_replaced(self):
         self.symvers += self.symvers.splitlines(keepends=True)[0]
@@ -168,7 +183,7 @@ class KmiPackagingChecks(PackagingChecks):
                          "unprotectedSymbols": ["register_kprobe"], "initKcfi": 0x36b1c5a6}
         self.elf.tags = self.elf.tags.replace(b"6.18.21-4k", b"6.6.127-real-ddk")
 
-    def inspect(self, data=b"fixture"):
+    def inspect(self, data=NO_DIRECT_MODULE):
         with patch.object(package, "ELFFile", return_value=self.elf):
             return package.inspect_module(data, "6.6.89-target", self.config, self.symvers, self.contract)
 
@@ -198,7 +213,7 @@ class KmiPackagingChecks(PackagingChecks):
         self.config["CONFIG_MODULE_SIG_PROTECT"] = "y"
         self.assertFalse(self.inspect()["coldBootOrSuQualified"])
         self.contract["unprotectedSymbols"] = []
-        for data in (b"fixture", b"fixture~Module signature appended~\n"):
+        for data in (NO_DIRECT_MODULE, NO_DIRECT_MODULE + b"~Module signature appended~\n"):
             with self.assertRaisesRegex(ValueError, "IMPORT_SIG_PROTECT:register_kprobe"):
                 self.inspect(data)
 
@@ -310,6 +325,7 @@ class PortableBundleChecks(unittest.TestCase):
         data = {name: ("memory-only " + name).encode() for name in self.paths}
         data.update(credential_file=b"A" * 48, target_config=b"CONFIG_ARM64=y\nCONFIG_MODULES=y\n",
                     target_contract=b'{"sourceReceipt":"relative/receipt.json","ready":false}\n')
+        data["bridge"] = NO_DIRECT_MODULE
         data["target_identity"] = json.dumps({"release": "6.18.21-4k",
             "configSha256": package.digest(data["target_config"]),
             "rawImageReference": {"sha256": package.digest(data["kernel_image"])}}).encode()
@@ -355,6 +371,19 @@ class PortableBundleChecks(unittest.TestCase):
         argv += ["--output", str(output)]
         if btf:
             argv += ["--btf", str(self.paths["btf"])]
+        actual_spec = package.importlib.util.spec_from_file_location
+        actual_module = package.importlib.util.module_from_spec
+        verifier_spec, verifier = Mock(), Mock()
+
+        def selected_spec(name, path):
+            if name == "ultra_init_build":
+                self.assertEqual(Path(path), self.paths["handoff_verifier"])
+                return verifier_spec
+            return actual_spec(name, path)
+
+        def selected_module(spec):
+            return verifier if spec is verifier_spec else actual_module(spec)
+
         with ExitStack() as stack:
             for method, replacement in (
                 ("read_bytes", read), ("read_text", lambda p, **kw: read(p).decode()),
@@ -363,15 +392,16 @@ class PortableBundleChecks(unittest.TestCase):
                 ("rename", rename)):
                 stack.enter_context(patch.object(Path, method, replacement))
             stack.enter_context(patch.object(sys, "argv", argv))
-            # ELF parsing and the shim verifier are covered separately; this
-            # fixture exercises actual main/publishing I/O, not loadability.
+            # Real ELF section parsing sees no session, task or runtime tables.
+            # Structural qualification and the handoff verifier remain separate
+            # ports: this fixture exercises main/publishing I/O, not loadability.
             stack.enter_context(patch.object(package, "inspect_module", return_value={"coldBootOrSuQualified": False}))
             stack.enter_context(patch.object(package, "module_credential",
                 **({"side_effect": AssertionError("generic path read a key")} if generic else {"return_value": b"A" * 48})))
             stack.enter_context(patch.object(package, "module_parameter_metadata",
                 return_value={"credentialMode": "module-parameter", "metadataDisplacement": 4064}))
-            stack.enter_context(patch.object(package.importlib.util, "spec_from_file_location", return_value=Mock()))
-            stack.enter_context(patch.object(package.importlib.util, "module_from_spec", return_value=Mock()))
+            stack.enter_context(patch.object(package.importlib.util, "spec_from_file_location", side_effect=selected_spec))
+            stack.enter_context(patch.object(package.importlib.util, "module_from_spec", side_effect=selected_module))
             package.main()
 
     def test_moved_bundle_resolves_every_flat_reference(self):
@@ -382,7 +412,7 @@ class PortableBundleChecks(unittest.TestCase):
             bundled = {moved / p.relative_to(output): blob for p, blob in self.files.items()
                        if p.is_relative_to(output)}
             manifest = json.loads(bundled[moved / "manifest.json"])
-            fields = {"targetBoot", "config", "moduleSymvers", "targetContract", "bridge", "handoff"}
+            fields = {"targetBoot", "config", "moduleSymvers", "targetContract", "bridge", "handoff", "bundleSources"}
             if btf:
                 fields.add("btf")
             credential_fields = {"credentialMode", "metadataDisplacement"} if generic else {"credentialSha256"}
