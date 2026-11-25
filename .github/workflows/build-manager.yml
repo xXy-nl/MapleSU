@@ -346,6 +346,21 @@ jobs:
           cp /tmp/kb/linux/include/generated/utsrelease.h linux/include/generated/utsrelease.h || true
           cp /tmp/kb/linux/include/config/kernel.release linux/include/config/kernel.release || true
           grep -m1 UTS_RELEASE linux/include/generated/utsrelease.h || true
+      - name: Probe stage.py overlays
+        run: |
+          set +e
+          python3 runtime/ultra/boot/init-bridge/stage.py \
+            --repo-root "$PWD" \
+            --host-overlay "$PWD/runtime/ultra/identity/kernel" \
+            --core-overlay "$PWD/runtime/ultra" \
+            --su-overlay "$PWD/runtime/maplesu-sdk/sdk/src/module" \
+            --kernel-source "$PWD/linux" \
+            --kernel-build "$PWD/linux" \
+            --out "$PWD/stage-out" > /tmp/stage.log 2>&1
+          echo "stage rc=$?"
+          tail -n 40 /tmp/stage.log
+          ls -l "$PWD/stage-out" 2>/dev/null | head -20
+          set -e
       - name: Build bridge
         run: |
           echo "python: $(python3 --version)"
