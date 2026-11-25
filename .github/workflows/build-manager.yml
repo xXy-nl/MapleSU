@@ -288,9 +288,9 @@ jobs:
             --repo-root "$PWD" \
             --kernel-build "$PWD/linux" \
             --llvm-bin /usr/lib/llvm-18/bin \
-            --module-source "$PWD/runtime/ultra/boot/init-bridge" \
+            --module-source "$PWD/stage-out" \
             --evidence "$PWD/bridge-evidence" \
-            --source "$PWD/runtime/ultra/boot/init-bridge/bridge.c" \
+            --source "$PWD/stage-out/bridge.c" \
             --kernel-source "$PWD/linux" 2>&1 | tail -n 60
           ls -l runtime/ultra/boot/init-bridge/*.ko || true
           exit $rc
@@ -340,6 +340,7 @@ jobs:
           ls -R /tmp/kb | head -40
           cp ci/kernel/target.config linux/.config
           make -C linux ARCH=arm64 LLVM=1 olddefconfig > /tmp/olddef.log 2>&1 || { tail -n 20 /tmp/olddef.log; exit 1; }
+          : > linux/.scmversion
           make -C linux ARCH=arm64 LLVM=1 -j"$(nproc)" prepare > /tmp/prepare.log 2>&1 || { tail -n 30 /tmp/prepare.log; exit 1; }
           cp /tmp/kb/linux/Module.symvers linux/Module.symvers
           mkdir -p linux/include/generated linux/include/config
@@ -365,7 +366,7 @@ jobs:
         run: |
           echo "python: $(python3 --version)"
           set +e
-          python3 runtime/ultra/boot/init-bridge/build_target.py --repo-root "$PWD" --kernel-build "$PWD/linux" --llvm-bin /usr/lib/llvm-18/bin --module-source "$PWD/runtime/ultra/boot/init-bridge" --evidence "$PWD/bridge-evidence" --source "$PWD/runtime/ultra/boot/init-bridge/bridge.c" --kernel-source "$PWD/linux" > /tmp/bridge.log 2>&1
+          python3 runtime/ultra/boot/init-bridge/build_target.py --repo-root "$PWD" --kernel-build "$PWD/linux" --llvm-bin /usr/lib/llvm-18/bin --module-source "$PWD/stage-out" --evidence "$PWD/bridge-evidence" --source "$PWD/stage-out/bridge.c" --kernel-source "$PWD/linux" > /tmp/bridge.log 2>&1
           rc=$?
           echo "bridge rc=$rc"
           set -e
