@@ -17,6 +17,7 @@ on:
         options:
           - manager
           - kernel-bridge
+          - kernel-build
         default: manager
         required: true
   pull_request:
@@ -181,3 +182,46 @@ jobs:
           python3 runtime/ultra/boot/init-bridge/package.py --help || true
           echo "=== package_catalog.py ==="
           python3 runtime/ultra/boot/init-bridge/package_catalog.py --help || true
+
+  kernel-build:
+    if: github.event_name == 'workflow_dispatch' && inputs.task == 'kernel-build'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libssl-dev libelf-dev lld llvm clang dwarves python3-pyelftools
+          clang --version
+          ld.lld --version
+      - name: Fetch OnePlus kernel source
+        run: |
+          curl -fL --retry 3 -o /tmp/kernel.tar.gz \
+            "https://codeload.github.com/OnePlusOSS/android_kernel_oneplus_sm8650/tar.gz/refs/heads/oneplus/sm8650_b_16.0.0_pad2"
+          mkdir -p linux
+          tar -xzf /tmp/kernel.tar.gz -C linux --strip-components=1
+          sed -n '1,5p' linux/Makefile
+      - name: Configure
+        run: |
+          cp ci/kernel/target.config linux/.config
+          make -C linux ARCH=arm64 LLVM=1 olddefconfig
+          grep -E '^CONFIG_LOCALVERSION=|^CONFIG_MODVERSIONS=|^CONFIG_MODULE_SIG' linux/.config | head -10
+      - name: Build kernel and module symbols
+        run: |
+          set -o pipefail
+          make -C linux ARCH=arm64 LLVM=1 -j"$(nproc)" Image modules 2>&1 | tail -n 60
+      - name: Report artifacts
+        run: |
+          ls -l linux/arch/arm64/boot/Image linux/Module.symvers linux/vmlinux || true
+          cat linux/include/config/kernel.release || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kernel-build
+          if-no-files-found: warn
+          path: |
+            linux/arch/arm64/boot/Image
+            linux/Module.symvers
+            linux/.config
+            linux/include/config/kernel.release
