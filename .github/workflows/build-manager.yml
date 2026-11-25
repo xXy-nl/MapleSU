@@ -293,6 +293,7 @@ jobs:
             --source "$PWD/runtime/ultra/boot/init-bridge/bridge.c" \
             --kernel-source "$PWD/linux" 2>&1 | tail -n 60
           ls -l runtime/ultra/boot/init-bridge/*.ko || true
+          exit $rc
       - name: Report artifacts
         run: |
           ls -l linux/arch/arm64/boot/Image linux/Module.symvers linux/vmlinux || true
@@ -337,9 +338,10 @@ jobs:
       - name: Overlay artifacts into tree
         run: |
           ls -R /tmp/kb | head -40
-          cp /tmp/kb/linux/Module.symvers linux/Module.symvers
           cp ci/kernel/target.config linux/.config
           make -C linux ARCH=arm64 LLVM=1 olddefconfig > /tmp/olddef.log 2>&1 || { tail -n 20 /tmp/olddef.log; exit 1; }
+          make -C linux ARCH=arm64 LLVM=1 -j"$(nproc)" prepare > /tmp/prepare.log 2>&1 || { tail -n 30 /tmp/prepare.log; exit 1; }
+          cp /tmp/kb/linux/Module.symvers linux/Module.symvers
           mkdir -p linux/include/generated linux/include/config
           cp /tmp/kb/linux/include/generated/utsrelease.h linux/include/generated/utsrelease.h || true
           cp /tmp/kb/linux/include/config/kernel.release linux/include/config/kernel.release || true
@@ -347,10 +349,15 @@ jobs:
       - name: Build bridge
         run: |
           echo "python: $(python3 --version)"
-          python3 runtime/ultra/boot/init-bridge/build_target.py --repo-root "$PWD" --kernel-build "$PWD/linux" --llvm-bin /usr/lib/llvm-18/bin --module-source "$PWD/runtime/ultra/boot/init-bridge" --evidence "$PWD/bridge-evidence" --source "$PWD/runtime/ultra/boot/init-bridge/bridge.c" --kernel-source "$PWD/linux" > /tmp/bridge.log 2>&1 || true
+          set +e
+          python3 runtime/ultra/boot/init-bridge/build_target.py --repo-root "$PWD" --kernel-build "$PWD/linux" --llvm-bin /usr/lib/llvm-18/bin --module-source "$PWD/runtime/ultra/boot/init-bridge" --evidence "$PWD/bridge-evidence" --source "$PWD/runtime/ultra/boot/init-bridge/bridge.c" --kernel-source "$PWD/linux" > /tmp/bridge.log 2>&1
+          rc=$?
+          echo "bridge rc=$rc"
+          set -e
           echo "--- bridge log ---"
           tail -n 80 /tmp/bridge.log
           ls -l runtime/ultra/boot/init-bridge/*.ko || true
+          exit $rc
       - uses: actions/upload-artifact@v4
         if: always()
         with:
