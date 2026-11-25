@@ -283,7 +283,6 @@ jobs:
       - name: Build Ultra bridge module
         run: |
           set -o pipefail
-          mkdir -p bridge-evidence
           python3 runtime/ultra/boot/init-bridge/build_target.py \
             --repo-root "$PWD" \
             --kernel-build "$PWD/linux" \
@@ -307,5 +306,7 @@ jobs:
             linux/Module.symvers
             linux/.config
             linux/include/config/kernel.release
+            linux/include/generated/utsrelease.h
+            linux/arch/arm64/boot/Image
             runtime/ultra/boot/init-bridge/*.ko
             bridge-evidence/**
