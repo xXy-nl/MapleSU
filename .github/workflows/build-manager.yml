@@ -280,6 +280,19 @@ jobs:
           done
           if [ ! -f linux/Module.symvers ]; then echo "BUILD FAILED: Module.symvers missing"; tail -n 40 /tmp/build.log; exit 1; fi
           ls -l linux/Module.symvers linux/arch/arm64/boot/Image
+      - name: Build Ultra bridge module
+        run: |
+          set -o pipefail
+          mkdir -p bridge-evidence
+          python3 runtime/ultra/boot/init-bridge/build_target.py \
+            --repo-root "$PWD" \
+            --kernel-build "$PWD/linux" \
+            --llvm-bin /usr/lib/llvm-18/bin \
+            --module-source "$PWD/runtime/ultra/boot/init-bridge" \
+            --evidence "$PWD/bridge-evidence" \
+            --source "$PWD/runtime/ultra/boot/init-bridge/bridge.c" \
+            --kernel-source "$PWD/linux" 2>&1 | tail -n 60
+          ls -l runtime/ultra/boot/init-bridge/*.ko || true
       - name: Report artifacts
         run: |
           ls -l linux/arch/arm64/boot/Image linux/Module.symvers linux/vmlinux || true
@@ -294,3 +307,5 @@ jobs:
             linux/Module.symvers
             linux/.config
             linux/include/config/kernel.release
+            runtime/ultra/boot/init-bridge/*.ko
+            bridge-evidence/**
