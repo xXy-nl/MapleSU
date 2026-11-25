@@ -199,7 +199,7 @@ jobs:
       - name: Fetch OnePlus kernel source
         run: |
           curl -fL --retry 3 -o /tmp/kernel.tar.gz \
-            "https://codeload.github.com/OnePlusOSS/android_kernel_oneplus_sm8650/tar.gz/refs/heads/oneplus/sm8650_b_16.0.0_pad2"
+            "https://codeload.github.com/cctv18/android_kernel_common_oneplus_sm8650/tar.gz/refs/heads/oneplus/sm8650_b_16.0.0_oneplus12_6.1.141"
           mkdir -p linux
           tar -xzf /tmp/kernel.tar.gz -C linux --strip-components=1
           sed -n '1,5p' linux/Makefile
