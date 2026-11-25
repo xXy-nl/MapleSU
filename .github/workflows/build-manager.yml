@@ -362,6 +362,15 @@ jobs:
           tail -n 40 /tmp/stage.log
           ls -l "$PWD/stage-out" 2>/dev/null | head -20
           set -e
+      - name: Augment staged headers
+        run: |
+          shopt -s nullglob
+          cp -v runtime/ultra/identity/kernel/*.h stage-out/ || true
+          cp -v runtime/ultra/authorization/*.h stage-out/ || true
+          cp -v runtime/maplesu-sdk/sdk/src/module/su_redirect_tu/kernel/*.h stage-out/ || true
+          cp -v runtime/ultra/boot/init-bridge/native-private/*.h stage-out/ || true
+          echo "--- stage-out headers ---"
+          ls stage-out | head -50
       - name: Build bridge
         run: |
           echo "python: $(python3 --version)"
