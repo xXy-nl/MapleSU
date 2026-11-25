@@ -205,33 +205,32 @@ jobs:
           sed -n '1,5p' linux/Makefile
       - name: Configure
         run: |
-          # OnePlus OSS omits vendor/: many Kconfig sources point at vendor symlinks that do not exist.
-          # Drop every dangling symlink, then comment out Kconfig sources whose target is absent.
+          # OnePlus OSS omits vendor/: Kconfig sources point at symlinks that do not exist.
           find linux -xtype l -print -delete
           python3 - <<'PY'
-import pathlib, re
-root = pathlib.Path("linux")
-patched = 0
-for kc in root.rglob("Kconfig*"):
-    if not kc.is_file():
-        continue
-    text = kc.read_text(errors="ignore")
-    out = []
-    dirty = False
-    for line in text.splitlines(True):
-        m = re.match(r'\s*source\s+"([^"]+)"', line)
-        if m:
-            target = (kc.parent / m.group(1)).resolve()
-            if not target.exists():
-                out.append("# " + line.rstrip("\n") + "  # target missing in OSS tree\n")
-                patched += 1
-                dirty = True
-                continue
-        out.append(line)
-    if dirty:
-        kc.write_text("".join(out), errors="ignore")
-print("patched kconfig sources:", patched)
-PY
+          import pathlib, re
+          root = pathlib.Path("linux")
+          patched = 0
+          for kc in root.rglob("Kconfig*"):
+              if not kc.is_file():
+                  continue
+              body = kc.read_text(errors="ignore")
+              out = []
+              dirty = False
+              for line in body.splitlines(True):
+                  m = re.match(r'\s*source\s+"([^"]+)"', line)
+                  if m:
+                      target = (kc.parent / m.group(1)).resolve()
+                      if not target.exists():
+                          out.append("# " + line.rstrip() + "  # target missing in OSS tree" + chr(10))
+                          patched += 1
+                          dirty = True
+                          continue
+                  out.append(line)
+              if dirty:
+                  kc.write_text("".join(out), errors="ignore")
+          print("patched kconfig sources:", patched)
+          PY
           cp ci/kernel/target.config linux/.config
           make -C linux ARCH=arm64 LLVM=1 olddefconfig
           grep -E '^CONFIG_LOCALVERSION=|^CONFIG_MODVERSIONS=|^CONFIG_MODULE_SIG' linux/.config | head -10
